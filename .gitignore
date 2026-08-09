@@ -1,0 +1,27 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data (raw/processed datasets — regenerate via each phase's script, don't commit large files)
+backend/phase1_data_acquisition/data/raw/*.csv
+backend/phase2_data_cleaning/data/processed/*.csv
+
+# Env / secrets
+.env
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Node (frontend, later phase)
+frontend/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI agent tooling / installed skill references (local machine state, not app code)
+.agents/
+.claude/
+skills-lock.json
