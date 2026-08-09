@@ -1,0 +1,73 @@
+.recommend-page {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  text-align: left;
+}
+
+.recommend-intro {
+  text-align: center;
+}
+
+.recommend-intro h1 {
+  font-size: 32px;
+  margin-bottom: var(--space-1);
+}
+
+.recommend-intro p {
+  color: var(--text);
+}
+
+.options-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  color: var(--text);
+}
+
+.preference-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+}
+
+.preference-cuisines {
+  grid-column: 1 / -1;
+}
+
+.preference-submit {
+  grid-column: 1 / -1;
+  margin-top: var(--space-2);
+}
+
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.restaurant-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--space-4);
+}
+
+.explanation {
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 560px) {
+  .preference-form {
+    grid-template-columns: 1fr;
+  }
+}
