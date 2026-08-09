@@ -1,0 +1,64 @@
+.multiselect {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.multiselect.has-error {
+  border-color: var(--error-border);
+}
+
+.multiselect input[type='text'] {
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding: 10px 12px;
+  font: inherit;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.multiselect input[type='text']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.multiselect-options {
+  max-height: 160px;
+  overflow-y: auto;
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.multiselect-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.multiselect-option:hover {
+  background: var(--code-bg);
+}
+
+.multiselect-empty {
+  padding: var(--space-2);
+  font-size: 13px;
+  color: var(--text);
+  margin: 0;
+}
+
+.multiselect-selected {
+  font-size: 13px;
+  color: var(--text);
+  margin: 0;
+}
