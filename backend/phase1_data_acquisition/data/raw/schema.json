@@ -1,0 +1,24 @@
+{
+  "train": {
+    "num_rows": 51717,
+    "columns": {
+      "url": "Value('string')",
+      "address": "Value('string')",
+      "name": "Value('string')",
+      "online_order": "Value('string')",
+      "book_table": "Value('string')",
+      "rate": "Value('string')",
+      "votes": "Value('int64')",
+      "phone": "Value('string')",
+      "location": "Value('string')",
+      "rest_type": "Value('string')",
+      "dish_liked": "Value('string')",
+      "cuisines": "Value('string')",
+      "approx_cost(for two people)": "Value('string')",
+      "reviews_list": "Value('string')",
+      "menu_item": "Value('string')",
+      "listed_in(type)": "Value('string')",
+      "listed_in(city)": "Value('string')"
+    }
+  }
+}
