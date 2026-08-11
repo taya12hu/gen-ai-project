@@ -1,4 +1,4 @@
-# Architecture — AI Restaurant Chat Assistant
+# Architecture: AI Restaurant Chat Assistant
 
 ## 1. Overview
 
@@ -8,36 +8,36 @@ its answers in both structured restaurant facts and real customer review
 text, remembering stated preferences (e.g. "I'm vegetarian") across
 conversations.
 
-**Data source:** [ManikaSaini/zomato-restaurant-recommendation](https://huggingface.co/datasets/ManikaSaini/zomato-restaurant-recommendation) (Hugging Face) — ~9,200 restaurants, ~226k customer reviews.
+**Data source:** [ManikaSaini/zomato-restaurant-recommendation](https://huggingface.co/datasets/ManikaSaini/zomato-restaurant-recommendation) (Hugging Face), with about 9,200 restaurants and 226k customer reviews.
 
-**Core design principle — hybrid retrieve-then-generate (RAG-style):**
+**Core design principle: hybrid retrieve-then-generate (RAG-style).**
 The LLM is never given the raw dataset or asked to "know" restaurants from
-memory. Structured facts (place, cuisine, price, rating) stay structured —
-exact/cheap SQL filtering. Only the qualitative part of a query ("quiet",
-"good for a date") goes through embeddings — pgvector semantic search over
-review text, restricted to the structured candidate pool when both are
-present, so "quiet date spot in Koramangala under ₹800" never returns a
-quiet place outside Koramangala just because its reviews scored well
-semantically. The LLM only ranks, explains, and phrases the reply from that
-grounded shortlist plus real review excerpts — never allowed to invent a
-restaurant or a claim not backed by the data it was given.
+memory. Structured facts (place, cuisine, price, rating) stay structured,
+using exact and cheap SQL filtering. Only the qualitative part of a query
+("quiet", "good for a date") goes through embeddings: pgvector semantic
+search over review text, restricted to the structured candidate pool when
+both are present, so "quiet date spot in Koramangala under ₹800" never
+returns a quiet place outside Koramangala just because its reviews scored
+well semantically. The LLM only ranks, explains, and phrases the reply from
+that grounded shortlist plus real review excerpts. It is never allowed to
+invent a restaurant or a claim that isn't backed by the data it was given.
 
 ```mermaid
 flowchart TD
-    U[User message] --> QU[Query Understanding<br/>LLM JSON-mode call]
-    QU -->|filters: place/cuisine/price/rating| SF[Structured SQL filter]
-    QU -->|vibe_query: qualitative text| VEC[(pgvector similarity search<br/>restaurant_reviews.embedding)]
-    QU -->|refers_to_previous_restaurant| REF[Resolve via last mentioned<br/>restaurant in this conversation]
-    SF --> HYB[Hybrid Retrieval<br/>semantic search restricted to<br/>the structured candidate pool]
+    U[User's message] --> QU[Understand the message<br/>AI reads it for filters, vibe, and references]
+    QU -->|place, cuisine, price, rating| SF[Filter restaurants in the database]
+    QU -->|descriptive vibe, e.g. "quiet", "good for a date"| VEC[(Search reviews by meaning)]
+    QU -->|refers to an earlier restaurant| REF[Work out which restaurant<br/>from earlier in this chat]
+    SF --> HYB[Combine into one shortlist]
     VEC --> HYB
     REF --> HYB
-    PREFS[(user_preferences<br/>soft defaults)] --> PB[Chat Prompt Builder]
-    HIST[(messages: prior turns,<br/>native chat history)] --> PB
+    PREFS[(Remembered preferences)] --> PB[Build the prompt for the AI]
+    HIST[(Earlier messages in this chat)] --> PB
     HYB --> PB
-    PB --> LLM[Groq LLM call<br/>Gemini fallback on error]
-    LLM --> RF[Response Formatter<br/>grounds restaurants + review snippets]
-    RF --> STORE[Persist turn to messages;<br/>upsert new preference facts]
-    RF --> OUT[Reply to user]
+    PB --> LLM[AI writes a reply<br/>backup AI steps in if the primary fails]
+    LLM --> RF[Check the reply against<br/>the real restaurant and review data]
+    RF --> STORE[Save the message and any new preferences]
+    RF --> OUT[Reply shown to the user]
 ```
 
 ---
@@ -45,7 +45,7 @@ flowchart TD
 ## 2. Backend package layout
 
 The backend is an installable Python package (`backend/pyproject.toml`,
-`pip install -e .`) organized by domain under `app/` — no `sys.path`
+`pip install -e .`) organized by domain under `app/`, with no `sys.path`
 manipulation anywhere; every cross-module import is a normal
 `from app.<domain>.<module> import ...`.
 
@@ -68,7 +68,7 @@ backend/
   evaluation/              scenario-based grounding/relevance evaluation (see EVALUATION.md)
 ```
 
-Each domain package carries its own colocated `tests/`. Databases schemas
+Each domain package carries its own colocated `tests/`. Database schemas
 (`schema.sql`) live next to the module that owns that table.
 
 ---
@@ -88,7 +88,7 @@ Each domain package carries its own colocated `tests/`. Databases schemas
 | Chat | `app/chat` | Multi-turn prompt construction, review-grounded response formatting, and the service layer orchestrating one full chat turn |
 | API | `app/api` | FastAPI app: auth routes + chat routes (including SSE token streaming), behind a JWT dependency |
 | Evaluation | `evaluation/` | Scenario-based grounding/relevance checks against the live retrieval + generation pipeline |
-| Frontend | `frontend/` | React app — chat is the sole post-login screen; login/register/forgot/reset-password flows |
+| Frontend | `frontend/` | React app. Chat is the sole post-login screen, plus login, register, forgot-password, and reset-password flows |
 
 ---
 
@@ -103,17 +103,17 @@ Each domain package carries its own colocated `tests/`. Databases schemas
 - **Query understanding is a separate LLM call from generation.** One call
   extracts structure from *one message*; a second call writes a grounded
   reply from a *candidate shortlist*. Mixing them would mean re-parsing the
-  model's own prose to figure out what it was asked — exactly the kind of
+  model's own prose to figure out what it was asked, exactly the kind of
   hallucination surface the rest of the pipeline avoids.
 - **JWT bearer auth, not server-side sessions.** The React SPA and FastAPI
   backend are separate processes talking over CORS; a signed, stateless
   token avoids needing shared session storage (Redis) at this scale. Token
-  persisted client-side in `localStorage` — simple and sufficient here, but
-  readable by JS (XSS risk); an httpOnly cookie would be more defensive if
-  hardened for production traffic.
+  is persisted client-side in `localStorage`: simple and sufficient here,
+  but readable by JS (an XSS risk); an httpOnly cookie would be more
+  defensive if hardened for production traffic.
 - **Preferences are soft defaults, not hard filters.** A stored fact like
   "vegetarian" is folded into the semantic (vibe) side of retrieval and
-  shown to the LLM as a bias, not enforced as a SQL `WHERE` clause — a
+  shown to the LLM as a bias, not enforced as a SQL `WHERE` clause, so a
   one-off request in the current message can still override it.
 - **Groq primary, Gemini fallback.** If Groq errors (rate limit, outage,
   bad key), both the chat-generation call and the query-understanding call
@@ -128,19 +128,21 @@ Each domain package carries its own colocated `tests/`. Databases schemas
   the codebase had one clear ownership structure per concern.
 - **Real logging, not silent by default.** Every domain module logs via
   `logging.getLogger(__name__)`, configured once (`app/logging_config.py`)
-  to write to both console and `backend/dump.log` (rotating, capped size) —
-  auth attempts/outcomes, retrieval candidate counts and relaxation/fallback
-  triggers, which LLM provider served a reply, and persisted chat turns are
-  all traceable after the fact without attaching a debugger.
+  to write to both console and `backend/dump.log` (rotating, capped size).
+  This covers auth attempts and outcomes, retrieval candidate counts and
+  relaxation/fallback triggers, which LLM provider served a reply, and
+  persisted chat turns, all traceable after the fact without attaching a
+  debugger.
 
 ## 5. Open decisions / explicitly out of scope
 
 - **Refresh-token rotation, email verification, rate-limiting on login,
-  role-based admin access** — none are required by the current feature set;
-  noted here so they're a deliberate omission, not an oversight.
-- **Deployment/monitoring** — no packaging/deploy pipeline or production
+  role-based admin access.** None of these are required by the current
+  feature set; noted here so they're a deliberate omission, not an
+  oversight.
+- **Deployment and monitoring.** No packaging/deploy pipeline or production
   logging/metrics infrastructure exists yet beyond the local `dump.log`;
   not yet needed at this project's stage.
 - **Statistical/large-scale LLM evaluation** (hundreds of scenarios, scored
-  rubrics) — not warranted at this project's scale; see `evaluation/EVALUATION.md`
-  for what's covered instead.
+  rubrics) is not warranted at this project's scale; see
+  `evaluation/EVALUATION.md` for what's covered instead.
