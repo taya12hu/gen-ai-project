@@ -1,157 +1,146 @@
-# Architecture — AI Restaurant Recommendation Service
+# Architecture — AI Restaurant Chat Assistant
 
 ## 1. Overview
 
-A service that takes structured user preferences (**price, place, rating, cuisine**), retrieves matching candidates from a restaurant dataset, and uses an **LLM** to turn them into a clear, natural-language recommendation — behind a login, through a polished, production-ready interface.
+A chat assistant that helps users find restaurants: users converse naturally
+("suggest a quiet vegetarian place under ₹1000"), and the assistant grounds
+its answers in both structured restaurant facts and real customer review
+text, remembering stated preferences (e.g. "I'm vegetarian") across
+conversations.
 
-**Data source:** [ManikaSaini/zomato-restaurant-recommendation](https://huggingface.co/datasets/ManikaSaini/zomato-restaurant-recommendation) (Hugging Face)
+**Data source:** [ManikaSaini/zomato-restaurant-recommendation](https://huggingface.co/datasets/ManikaSaini/zomato-restaurant-recommendation) (Hugging Face) — ~9,200 restaurants, ~226k customer reviews.
 
-**Core design principle — retrieve-then-generate (RAG-style):**
-The LLM is never given the raw dataset or asked to "know" restaurants from memory. A filtering/retrieval step narrows the dataset down to a small, relevant candidate set first; the LLM only ranks, explains, and phrases the recommendation from that grounded shortlist. This avoids hallucinated restaurants and keeps LLM cost/latency low.
+**Core design principle — hybrid retrieve-then-generate (RAG-style):**
+The LLM is never given the raw dataset or asked to "know" restaurants from
+memory. Structured facts (place, cuisine, price, rating) stay structured —
+exact/cheap SQL filtering. Only the qualitative part of a query ("quiet",
+"good for a date") goes through embeddings — pgvector semantic search over
+review text, restricted to the structured candidate pool when both are
+present, so "quiet date spot in Koramangala under ₹800" never returns a
+quiet place outside Koramangala just because its reviews scored well
+semantically. The LLM only ranks, explains, and phrases the reply from that
+grounded shortlist plus real review excerpts — never allowed to invent a
+restaurant or a claim not backed by the data it was given.
 
 ```mermaid
-flowchart LR
-    A[Login / Register] --> J[JWT Issued]
-    J --> U[User Preferences<br/>price, place, rating, cuisine]
-    U --> V[Preference Validation]
-    V --> R[Retrieval / Filtering Engine]
-    D[(Restaurant Dataset<br/>cleaned & indexed)] --> R
-    R --> C[Candidate Shortlist<br/>top N restaurants]
-    C --> P[Prompt Builder]
-    P --> L[LLM]
-    L --> F[Response Formatter]
-    F --> O[Final Recommendation<br/>to user]
+flowchart TD
+    U[User message] --> QU[Query Understanding<br/>LLM JSON-mode call]
+    QU -->|filters: place/cuisine/price/rating| SF[Structured SQL filter]
+    QU -->|vibe_query: qualitative text| VEC[(pgvector similarity search<br/>restaurant_reviews.embedding)]
+    QU -->|refers_to_previous_restaurant| REF[Resolve via last mentioned<br/>restaurant in this conversation]
+    SF --> HYB[Hybrid Retrieval<br/>semantic search restricted to<br/>the structured candidate pool]
+    VEC --> HYB
+    REF --> HYB
+    PREFS[(user_preferences<br/>soft defaults)] --> PB[Chat Prompt Builder]
+    HIST[(messages: prior turns,<br/>native chat history)] --> PB
+    HYB --> PB
+    PB --> LLM[Groq LLM call<br/>Gemini fallback on error]
+    LLM --> RF[Response Formatter<br/>grounds restaurants + review snippets]
+    RF --> STORE[Persist turn to messages;<br/>upsert new preference facts]
+    RF --> OUT[Reply to user]
 ```
 
 ---
 
-## 2. Phases
+## 2. Backend package layout
 
-### Phase 1 — Data Acquisition
-- Pull the dataset from Hugging Face (`ManikaSaini/zomato-restaurant-recommendation`) via the `datasets` library or the HF Hub API.
-- Persist a raw, untouched local/cloud copy (source of truth for reprocessing).
-- Capture dataset schema, size, and field meanings (what "place", "price", "rating", "cuisine" actually look like in the raw data).
+The backend is an installable Python package (`backend/pyproject.toml`,
+`pip install -e .`) organized by domain under `app/` — no `sys.path`
+manipulation anywhere; every cross-module import is a normal
+`from app.<domain>.<module> import ...`.
 
-### Phase 2 — Data Cleaning & Normalization
-- Handle missing/null values (e.g., missing rating or cuisine).
-- Normalize categorical fields:
-  - **Cuisine** → consistent taxonomy (split multi-cuisine strings, standardize casing/spelling).
-  - **Place/Location** → standardized city/area names.
-  - **Price** → consistent numeric range or bucketed tiers (e.g., ₹, ₹₹, ₹₹₹).
-  - **Rating** → consistent numeric scale.
-- Deduplicate entries.
-- Output a clean, processed dataset ready for querying.
+```
+backend/
+  app/                     installable package
+    settings.py            loads backend/.env once, on first import of `app`
+    logging_config.py      configures the "app" logger tree -> console + backend/dump.log
+    data/                  acquisition.py, cleaning.py (one-off dataset prep scripts)
+    storage/               db.py (pooled connection), schema.py, load.py
+    auth/                  tokens.py (JWT/bcrypt), users.py, password_reset.py, email.py, schema.py
+    llm/                   groq_client.py (primary), gemini_client.py (fallback)
+    reviews/                schema.py, ingest.py, embed.py, embedding_model.py
+    conversation/           store.py (conversations/messages), preferences.py (durable facts), schema.py
+    retrieval/               known_values.py, hybrid.py, cache.py
+    query_understanding/     understanding.py
+    chat/                     prompt_builder.py, response_formatter.py, service.py
+    api/                      main.py (FastAPI app + routes)
+  data/                    raw/processed datasets (gitignored CSVs; not shipped in the package)
+  evaluation/              scenario-based grounding/relevance evaluation (see EVALUATION.md)
+```
 
-### Phase 3 — Storage & Indexing
-- Load the cleaned data into **PostgreSQL** for structured filtering (preferences are all structured attributes — no vector search required for this stage).
-- Add indexes on `cuisine`, `place`, `price`, `rating` to make filtering fast.
-- (Optional/future) Add embeddings if free-text preferences (e.g., "romantic place for a date") are supported later.
-
-### Phase 4 — Preference Input Layer
-- Define the accepted input schema: price range/tier, place, minimum rating, cuisine(s).
-- Validate and normalize incoming user input against the same taxonomy used in Phase 2 (so filters actually match stored values).
-
-### Phase 5 — Retrieval / Filtering Engine
-- Query the store using the validated preferences.
-- Rank/filter down to a small candidate shortlist (e.g., top 5–10) using deterministic rules (rating desc, price fit, cuisine/place match).
-- This shortlist is the *only* restaurant data the LLM will ever see.
-
-### Phase 6 — Prompt Construction
-- Build a structured prompt containing:
-  - The user's original preferences.
-  - The candidate shortlist (name, cuisine, price, rating, place — factual fields only).
-  - Instructions constraining the LLM to recommend **only** from the given shortlist and to explain its choice.
-
-### Phase 7 — LLM Recommendation Engine
-- Send the prompt to **Groq** (chat completion).
-- LLM selects/ranks from the shortlist and produces a natural-language explanation (why this restaurant fits the stated preferences).
-
-### Phase 8 — Response Formatting & Output
-- Parse the LLM's output into a consistent response shape: recommended restaurant(s) + reasoning + key facts (cuisine/price/rating/place).
-- Ensure the final output reads as one clear, user-friendly recommendation (not a raw dump).
-
-### Phase 9 — Authentication & Authorization
-
-**Where this fits and why:** Phases 4–8 are pure, user-agnostic backend logic — filtering restaurants, building prompts, calling the LLM, formatting output. None of it needs to know *who* is asking, so it stays simple and independently testable. Authentication only becomes meaningful once that logic is exposed to real people over a network — which is exactly what Phase 10 (Interface Layer) does next. Placing Auth here, right before the API is wired up for real use, means:
-- Phases 4–8 never had to thread a `user_id` through logic that doesn't need it.
-- The new `users` table extends the existing PostgreSQL storage (Phase 3) without touching the `restaurants` schema.
-- The Interface Layer (Phase 10) can consume a ready-made "require login" dependency instead of retrofitting one later.
-- The frontend (Phase 11) builds its login/register screens against auth endpoints that already work.
-
-**What this phase includes:**
-- **User registration** — `POST /auth/register`: email + password (+ display name), stored in a new `users` table.
-- **Password hashing** — passwords are never stored in plaintext; hashed with **bcrypt** (adaptive cost, industry standard) before touching the database.
-- **Login** — `POST /auth/login`: verifies email/password against the stored hash, issues a signed **JWT** access token on success.
-- **JWT-based authentication** (over server-side sessions) — chosen because the frontend (React SPA) and backend (FastAPI) are already separate processes talking over CORS-configured HTTP. A stateless bearer token avoids needing shared session storage (e.g., Redis), which isn't warranted at this project's scale. The token is signed with a secret key (env var), carries the user id and an expiry, and is sent as `Authorization: Bearer <token>` on every subsequent request.
-- **Protected API routes** — a reusable FastAPI dependency decodes and validates the JWT on incoming requests; applied to `/recommend` so only logged-in users can get recommendations.
-- **Authorization** — beyond "is this token valid," routes touching user-specific data (e.g., the profile endpoint) check that the token's user id matches the resource being accessed (ownership-based authorization), not just that *some* valid user is logged in.
-- **User management** — `GET /auth/me` (view own profile). Logout is handled client-side (discard the token), since JWTs are stateless.
-
-**How it interacts with each layer:**
-- **PostgreSQL:** a new `users` table (id, email unique, hashed_password, display name, created_at), added with the same indexing/constraint conventions established in Phase 3.
-- **FastAPI:** new `/auth/register`, `/auth/login`, `/auth/me` routes, plus a `get_current_user` dependency (decodes the `Authorization` header, loads the user, raises 401 if invalid/expired/missing) applied to `/recommend` and future protected routes.
-- **React:** a login/register form, an auth context/provider holding the current user + token (persisted to `localStorage` so a page refresh doesn't log the user out), an `Authorization` header attached to every API call once logged in, and route guarding that redirects unauthenticated users to the login screen before they can reach the preference form.
-
-### Phase 10 — Application / Interface Layer
-- **Backend API** (FastAPI): exposes `/auth/*` (Phase 9) and `/recommend` (now behind the login-required dependency), plus `/options` for populating the frontend's dropdowns.
-- **Web UI**: the React app calling these endpoints — its design process is its own dedicated phase next, not treated as an afterthought.
-
-### Phase 11 — UI/UX Design & Frontend Development
-
-This is not "build a React page" — it's a deliberate design process before and during implementation, covering the full experience rather than a single form:
-- **User flows** — map the actual screens and transitions: Landing → Register/Login → Preference Form → Loading → Results (or Empty/Error) → Profile/Logout. Every transition has an obvious next action.
-- **Wireframing** — low-fidelity layout sketches for each screen (content hierarchy, placement of key actions) decided *before* writing component code.
-- **Component design** — a small reusable component set (Button, Input/Select, Card, Navbar, Spinner, Alert/Toast, Modal) built on shared design tokens (color palette, spacing scale, typography scale) instead of one-off inline styles per screen.
-- **Responsive layouts** — mobile/tablet/desktop breakpoints; the results grid and navigation adapt rather than just shrinking.
-- **Loading states** — visible feedback while waiting on calls that aren't instant (the LLM call especially can take a few seconds) — skeletons/spinners, not a frozen-looking button.
-- **Empty states** — a clear, friendly screen before any search has been made, distinct from the "search found nothing" state.
-- **Error states** — one consistent visual pattern (banner/toast) for validation errors, unknown place/cuisine, network failures, and auth failures (expired/missing token → prompted to log in again).
-- **Navigation** — a persistent header with branding and account controls (login/logout, profile), so the app reads as one coherent product.
-- **Accessibility** — semantic HTML, labelled form controls, visible focus states, sufficient color contrast, full keyboard operability.
-- **Visual polish** — a deliberate, consistent look rather than default browser form styling, so the result reads as production-ready.
-
-This phase rebuilds the plain form UI from Phase 10 with the auth flow included and the above design rigor applied.
-
-### Phase 12 — Testing & Evaluation
-- Unit tests for cleaning/normalization and the filtering engine (deterministic, easy to test in isolation).
-- Evaluation of LLM output quality: does it stay grounded in the shortlist (no hallucinated restaurants), is the reasoning relevant to the stated preferences.
-- Auth-specific tests: registration/login flows, password hashing correctness, rejected/expired/missing tokens, ownership-based authorization.
-- UI verification of the rebuilt frontend (Phase 11) against the live backend.
-
-### Phase 13 — Deployment & Monitoring
-- Package the service, deploy it, add logging (inputs, shortlist size, LLM latency/cost) and basic monitoring.
-- The final phase, once authentication, the polished UI, and full testing are all in place.
+Each domain package carries its own colocated `tests/`. Databases schemas
+(`schema.sql`) live next to the module that owns that table.
 
 ---
 
-## 3. Component Summary
+## 3. Components
 
-| Component | Responsibility |
-|---|---|
-| Data Ingestion | Fetch raw dataset from Hugging Face |
-| Data Cleaning | Normalize price/place/rating/cuisine fields |
-| Storage Layer | PostgreSQL, indexed for fast filtering |
-| Preference Validator | Normalize/validate user input against known taxonomy |
-| Retrieval Engine | Filter dataset → candidate shortlist |
-| Prompt Builder | Assemble grounded prompt from shortlist + preferences |
-| LLM Layer | Groq — rank/explain recommendation from shortlist only |
-| Response Formatter | Produce final user-facing recommendation |
-| Auth Service | Register/login users, hash passwords, issue & validate JWTs |
-| User Store | `users` table in PostgreSQL (extends Phase 3 storage) |
-| Interface Layer | FastAPI backing API, `/recommend` behind login |
-| Frontend (UI/UX) | React app — flows, components, responsive/accessible design |
+| Component | Package | Responsibility |
+|---|---|---|
+| Data prep | `app/data` | One-off scripts: fetch the raw HF dataset, clean/normalize/dedup it into `restaurants_clean.csv` |
+| Storage | `app/storage` | PostgreSQL connection pool (`ThreadedConnectionPool`) + `restaurants` schema/load |
+| Auth | `app/auth` | Registration/login, bcrypt password hashing, JWT issue/verify, password reset tokens, transactional email (Resend) |
+| LLM | `app/llm` | Groq client (primary) with automatic Gemini fallback on error; shared by query understanding and chat generation |
+| Review Ingestion | `app/reviews` | Re-derives individual reviews from the raw dataset, embeds them locally (`sentence-transformers`, 384-dim), stores in pgvector |
+| Conversation Store | `app/conversation` | `conversations`/`messages` (multi-turn memory) and `user_preferences` (durable, cross-session soft-default facts) |
+| Retrieval | `app/retrieval` | Known place/cuisine values (for snapping free text to canonical DB casing); hybrid structured-SQL + pgvector semantic retrieval, with an in-process TTL cache in front of it |
+| Query Understanding | `app/query_understanding` | One LLM JSON-mode call per message: intent, hard filters, vibe query, reference resolution, durable preference extraction |
+| Chat | `app/chat` | Multi-turn prompt construction, review-grounded response formatting, and the service layer orchestrating one full chat turn |
+| API | `app/api` | FastAPI app: auth routes + chat routes (including SSE token streaming), behind a JWT dependency |
+| Evaluation | `evaluation/` | Scenario-based grounding/relevance checks against the live retrieval + generation pipeline |
+| Frontend | `frontend/` | React app — chat is the sole post-login screen; login/register/forgot/reset-password flows |
 
 ---
 
-## 4. Tech Stack Decisions
+## 4. Key design decisions
 
-- **Storage:** PostgreSQL
-- **LLM provider:** Groq (`llama-3.3-70b-versatile`)
-- **Interface:** Web UI (React), calling a backing API (FastAPI)
-- **Auth:** JWT (`PyJWT`) bearer tokens + `bcrypt` password hashing; token persisted client-side in `localStorage`
+- **Hybrid retrieval, not pure RAG-over-everything.** Structured constraints
+  (place/cuisine/price/rating) are always exact SQL; only the qualitative
+  remainder of a query goes through embeddings, and semantic search is
+  restricted to the structured candidate pool when both are present. Cheaper
+  and keeps hard constraints exact, at the cost of needing a query
+  understanding step to separate the two.
+- **Query understanding is a separate LLM call from generation.** One call
+  extracts structure from *one message*; a second call writes a grounded
+  reply from a *candidate shortlist*. Mixing them would mean re-parsing the
+  model's own prose to figure out what it was asked — exactly the kind of
+  hallucination surface the rest of the pipeline avoids.
+- **JWT bearer auth, not server-side sessions.** The React SPA and FastAPI
+  backend are separate processes talking over CORS; a signed, stateless
+  token avoids needing shared session storage (Redis) at this scale. Token
+  persisted client-side in `localStorage` — simple and sufficient here, but
+  readable by JS (XSS risk); an httpOnly cookie would be more defensive if
+  hardened for production traffic.
+- **Preferences are soft defaults, not hard filters.** A stored fact like
+  "vegetarian" is folded into the semantic (vibe) side of retrieval and
+  shown to the LLM as a bias, not enforced as a SQL `WHERE` clause — a
+  one-off request in the current message can still override it.
+- **Groq primary, Gemini fallback.** If Groq errors (rate limit, outage,
+  bad key), both the chat-generation call and the query-understanding call
+  automatically retry against Gemini rather than failing the request
+  outright.
+- **A real installable package, not `sys.path.insert()`.** Every
+  cross-module import is a normal package import. This isn't just cosmetic:
+  a `sys.path`-hacked layout previously let the same retrieval/relax-on-empty
+  logic get duplicated across two unrelated modules unnoticed, and separately
+  contributed to a real connection-pool deadlock bug (a re-entrant `close()`
+  call recursing into a non-reentrant lock) that only became avoidable once
+  the codebase had one clear ownership structure per concern.
+- **Real logging, not silent by default.** Every domain module logs via
+  `logging.getLogger(__name__)`, configured once (`app/logging_config.py`)
+  to write to both console and `backend/dump.log` (rotating, capped size) —
+  auth attempts/outcomes, retrieval candidate counts and relaxation/fallback
+  triggers, which LLM provider served a reply, and persisted chat turns are
+  all traceable after the fact without attaching a debugger.
 
-## 5. Notes / Open Decisions
+## 5. Open decisions / explicitly out of scope
 
-- **Token storage tradeoff:** `localStorage` is simple and sufficient at this project's scale, but is readable by JS (XSS risk) — an httpOnly cookie would be more defensive if this were hardened for production traffic.
-- **Explicitly out of scope for now:** refresh-token rotation, email verification, rate-limiting on login, role-based admin access. None are required by the current feature set; noted here so they're a deliberate omission, not an oversight.
-- Phases 1–8 were implemented and tested before this restructuring; Phases 9–13 (Auth, Interface polish, UI/UX, Testing, Deployment) follow the phase-wise build-and-test process established throughout.
+- **Refresh-token rotation, email verification, rate-limiting on login,
+  role-based admin access** — none are required by the current feature set;
+  noted here so they're a deliberate omission, not an oversight.
+- **Deployment/monitoring** — no packaging/deploy pipeline or production
+  logging/metrics infrastructure exists yet beyond the local `dump.log`;
+  not yet needed at this project's stage.
+- **Statistical/large-scale LLM evaluation** (hundreds of scenarios, scored
+  rubrics) — not warranted at this project's scale; see `evaluation/EVALUATION.md`
+  for what's covered instead.
