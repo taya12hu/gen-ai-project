@@ -1,5 +1,5 @@
 """
-Phase 3 - Storage & Indexing.
+Storage & Indexing.
 
 Applies schema.sql (table + indexes) to the configured Postgres database.
 Safe to re-run: uses `if not exists` throughout.
@@ -7,7 +7,7 @@ Safe to re-run: uses `if not exists` throughout.
 
 from pathlib import Path
 
-from db import get_connection
+from app.storage.db import get_connection
 
 SCHEMA_SQL = Path(__file__).resolve().parent / "schema.sql"
 

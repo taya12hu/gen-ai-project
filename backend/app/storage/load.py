@@ -1,23 +1,19 @@
 """
-Phase 3 - Storage & Indexing.
+Storage & Indexing.
 
-Loads the cleaned dataset from Phase 2 (phase2_data_cleaning/data/processed/
-restaurants_clean.csv) into the `restaurants` table. Idempotent: truncates
-the table first, so re-running produces a consistent state rather than
-duplicate/appended rows.
+Loads the cleaned dataset (backend/data/processed/restaurants_clean.csv,
+produced by app.data.cleaning) into the `restaurants` table. Idempotent:
+truncates the table first, so re-running produces a consistent state rather
+than duplicate/appended rows.
 """
-
-from pathlib import Path
 
 import pandas as pd
 from psycopg2.extras import execute_values
 
-from db import get_connection
+from app.settings import DATA_DIR
+from app.storage.db import get_connection
 
-PHASE_DIR = Path(__file__).resolve().parent
-CLEAN_CSV = (
-    PHASE_DIR.parent / "phase2_data_cleaning" / "data" / "processed" / "restaurants_clean.csv"
-)
+CLEAN_CSV = DATA_DIR / "processed" / "restaurants_clean.csv"
 
 BATCH_SIZE = 1000
 

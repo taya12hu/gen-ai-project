@@ -1,25 +1,18 @@
 """
-Tests for Phase 3 - Storage & Indexing.
+Tests for Storage & Indexing.
 
 Runs against the live Supabase Postgres database configured in backend/.env.
 Verifies the schema (table, columns, indexes, constraints) and that the
-data loaded from Phase 2 is queryable and correctly indexed.
+cleaned dataset is queryable and correctly indexed.
 """
-
-import sys
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
-PHASE_DIR = Path(__file__).resolve().parent.parent
-CLEAN_CSV = (
-    PHASE_DIR.parent / "phase2_data_cleaning" / "data" / "processed" / "restaurants_clean.csv"
-)
+from app.settings import DATA_DIR
+from app.storage.db import get_connection
 
-sys.path.insert(0, str(PHASE_DIR))
-
-from db import get_connection  # noqa: E402
+CLEAN_CSV = DATA_DIR / "processed" / "restaurants_clean.csv"
 
 
 @pytest.fixture(scope="module")
