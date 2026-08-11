@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { ApiError } from '../lib/api'
+import { friendlyErrorMessage } from '../lib/errorMessages'
 import Card from '../components/Card'
 import { TextField } from '../components/Field'
 import Button from '../components/Button'
@@ -28,7 +28,7 @@ export default function RegisterPage() {
       await register(email, password, displayName)
       navigate('/')
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
+      setError(friendlyErrorMessage(err))
     } finally {
       setLoading(false)
     }
@@ -37,7 +37,7 @@ export default function RegisterPage() {
   return (
     <div className="auth-page">
       <Card className="auth-card">
-        <div>
+        <div className="auth-card-header">
           <h1>Create an account</h1>
           <p className="auth-subtitle">Sign up to start getting recommendations.</p>
         </div>
