@@ -1,9 +1,9 @@
 """
-Phase 2 - Data Cleaning & Normalization.
+Data Cleaning & Normalization.
 
-Reads the raw dataset produced by Phase 1 (phase1_data_acquisition/data/raw/train.csv),
+Reads the raw dataset produced by acquisition.py (backend/data/raw/train.csv),
 normalizes the fields the pipeline depends on (price, place, rating, cuisine),
-deduplicates, and writes a clean dataset to data/processed/.
+deduplicates, and writes a clean dataset to backend/data/processed/.
 
 Deduplication note: the raw data repeats each restaurant once per Zomato
 listing category (listed_in(type): Buffet/Delivery/Dine-out/...) and per
@@ -13,13 +13,13 @@ for recommending a restaurant.
 """
 
 import re
-from pathlib import Path
 
 import pandas as pd
 
-PHASE_DIR = Path(__file__).resolve().parent
-RAW_CSV = PHASE_DIR.parent / "phase1_data_acquisition" / "data" / "raw" / "train.csv"
-PROCESSED_DIR = PHASE_DIR / "data" / "processed"
+from app.settings import DATA_DIR
+
+RAW_CSV = DATA_DIR / "raw" / "train.csv"
+PROCESSED_DIR = DATA_DIR / "processed"
 OUTPUT_CSV = PROCESSED_DIR / "restaurants_clean.csv"
 
 RATE_PATTERN = re.compile(r"^\s*(\d(?:\.\d)?)\s*/\s*5\s*$")

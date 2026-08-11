@@ -1,18 +1,19 @@
 """
-Phase 1 - Data Acquisition.
+Data Acquisition.
 
 Pulls the Zomato restaurant recommendation dataset from Hugging Face
 (ManikaSaini/zomato-restaurant-recommendation) and persists a raw,
-untouched local copy under phase1_data_acquisition/data/raw/.
+untouched local copy under backend/data/raw/.
 """
 
 import json
-from pathlib import Path
 
 from datasets import load_dataset
 
+from app.settings import DATA_DIR
+
 DATASET_ID = "ManikaSaini/zomato-restaurant-recommendation"
-RAW_DIR = Path(__file__).resolve().parent / "data" / "raw"
+RAW_DIR = DATA_DIR / "raw"
 
 
 def main() -> None:

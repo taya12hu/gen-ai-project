@@ -1,23 +1,18 @@
 """
-Tests for Phase 2 - Data Cleaning & Normalization.
+Tests for Data Cleaning & Normalization.
 
 Covers the parsing functions directly (unit tests for the quirky raw formats
 found in the dataset) and the produced artifact (data/processed/restaurants_clean.csv).
 """
 
-import sys
-from pathlib import Path
-
 import pandas as pd
 import pytest
 
-PHASE_DIR = Path(__file__).resolve().parent.parent
-PROCESSED_CSV = PHASE_DIR / "data" / "processed" / "restaurants_clean.csv"
-RAW_CSV = PHASE_DIR.parent / "phase1_data_acquisition" / "data" / "raw" / "train.csv"
+from app.data import cleaning as clean_data
+from app.settings import DATA_DIR
 
-sys.path.insert(0, str(PHASE_DIR))
-
-import clean_data  # noqa: E402
+PROCESSED_CSV = DATA_DIR / "processed" / "restaurants_clean.csv"
+RAW_CSV = DATA_DIR / "raw" / "train.csv"
 
 
 # --- Unit tests: parse_rating -----------------------------------------------

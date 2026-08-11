@@ -1,21 +1,21 @@
 """
-Tests for Phase 1 - Data Acquisition.
+Tests for Data Acquisition.
 
-Verifies that fetch_data.py is wired up correctly and that the raw dataset
+Verifies that acquisition.py is wired up correctly and that the raw dataset
 artifacts it produces (train.csv, schema.json) are present and well-formed.
 Does not hit the network: it checks the artifacts already produced by
-running `fetch_data.py`, plus the script's own configuration.
+running `python -m app.data.acquisition`, plus the script's own configuration.
 """
 
 import json
-import sys
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
-PHASE_DIR = Path(__file__).resolve().parent.parent
-RAW_DIR = PHASE_DIR / "data" / "raw"
+from app.data import acquisition
+from app.settings import DATA_DIR
+
+RAW_DIR = DATA_DIR / "raw"
 TRAIN_CSV = RAW_DIR / "train.csv"
 SCHEMA_JSON = RAW_DIR / "schema.json"
 
@@ -31,19 +31,13 @@ REQUIRED_COLUMNS = {
     "name",
 }
 
-sys.path.insert(0, str(PHASE_DIR))
-
 
 def test_fetch_script_targets_correct_dataset():
-    import fetch_data
-
-    assert fetch_data.DATASET_ID == EXPECTED_DATASET_ID
+    assert acquisition.DATASET_ID == EXPECTED_DATASET_ID
 
 
-def test_fetch_script_raw_dir_resolves_under_phase_data_raw():
-    import fetch_data
-
-    assert fetch_data.RAW_DIR == RAW_DIR
+def test_fetch_script_raw_dir_resolves_under_data_raw():
+    assert acquisition.RAW_DIR == RAW_DIR
 
 
 def test_raw_csv_exists():
@@ -87,6 +81,6 @@ def test_schema_json_exists_and_is_valid():
     ["4.1/5", "3.8/5"],
 )
 def test_sample_rate_values_look_parseable(value):
-    # Sanity check on the raw 'rate' format assumed by Phase 2 cleaning.
+    # Sanity check on the raw 'rate' format assumed by app.data.cleaning.
     assert value.endswith("/5")
     float(value.split("/")[0])
