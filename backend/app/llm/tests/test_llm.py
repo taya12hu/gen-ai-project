@@ -1,27 +1,15 @@
 """
-Tests for Phase 7 - LLM Recommendation Engine.
+Tests for the Groq LLM client.
 
 Model-resolution logic is tested with a fake Groq client (fast, free, no
 network). Two integration tests make real calls to Groq to confirm the API
-key/connection actually work and that responses stay grounded in the
-candidate list provided by Phase 6 (not hallucinated).
+key/connection actually work and that responses stay grounded in a given
+candidate list (not hallucinated).
 """
-
-import sys
-from pathlib import Path
 
 import pytest
 
-PHASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PHASE_DIR))
-sys.path.insert(0, str(PHASE_DIR.parent / "phase4_preference_input"))
-sys.path.insert(0, str(PHASE_DIR.parent / "phase5_retrieval_engine"))
-sys.path.insert(0, str(PHASE_DIR.parent / "phase6_prompt_construction"))
-
-import llm_client  # noqa: E402
-from preferences import UserPreferences  # noqa: E402
-from retrieval import RetrievalResult  # noqa: E402
-from prompt_builder import build_prompt  # noqa: E402
+from app.llm import groq_client as llm_client
 
 
 class FakeMessage:
@@ -119,22 +107,26 @@ def test_real_call_stays_grounded_in_candidate_list():
     # A deliberately distinctive, made-up name a model wouldn't know unless
     # it actually read the candidate list we gave it.
     distinctive_name = "Zzyzx Noodle Palace"
-    candidates = [
+    messages = [
         {
-            "id": 1,
-            "name": distinctive_name,
-            "place": "Indiranagar",
-            "city": "Indiranagar",
-            "cuisines": ["Chinese"],
-            "price": 500.0,
-            "rating": 4.5,
-            "rest_type": "Casual Dining",
-            "votes": 100,
-        }
+            "role": "system",
+            "content": (
+                "You are a restaurant recommendation assistant. Recommend ONLY "
+                "restaurants that appear in the candidate list below. Never invent, "
+                "assume, or reference any restaurant not in that list."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "User preferences:\n- Place: Indiranagar\n- Cuisines: Chinese\n\n"
+                "Candidate restaurants (ranked by rating):\n"
+                f"1. {distinctive_name} — Chinese; Rs 500 for two; 4.5★ (100 votes); Casual Dining\n\n"
+                "Based only on the candidates above, recommend the best restaurant(s) "
+                "for this user and explain briefly why each recommendation fits."
+            ),
+        },
     ]
-    prefs = UserPreferences(place="Indiranagar", cuisines=["Chinese"], max_price=800, min_rating=4.0)
-    result = RetrievalResult(candidates=candidates, relaxed=False)
-    messages = build_prompt(prefs, result)
 
     response = llm_client.get_recommendation(messages)
     assert distinctive_name in response
