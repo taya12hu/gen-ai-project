@@ -14,11 +14,13 @@
 .field input,
 .field select {
   font: inherit;
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
+  min-height: 44px;
+  padding: 10px 18px;
+  border-radius: var(--radius-pill);
   border: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--surface);
   color: var(--text-h);
+  box-sizing: border-box;
 }
 
 .field input:focus-visible,

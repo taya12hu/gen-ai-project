@@ -1,0 +1,50 @@
+.chat-bubble-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.chat-bubble-row-user {
+  align-items: flex-end;
+}
+
+.chat-bubble {
+  max-width: 640px;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  text-align: left;
+}
+
+.chat-bubble p {
+  margin: 0;
+}
+
+.chat-bubble-user {
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--text-h);
+  border-bottom-right-radius: var(--space-2);
+}
+
+.chat-bubble-assistant {
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--text-h);
+  border-bottom-left-radius: var(--space-2);
+}
+
+.chat-bubble-restaurants {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-3);
+}
+
+@media (max-width: 560px) {
+  .chat-bubble {
+    max-width: 100%;
+  }
+}
