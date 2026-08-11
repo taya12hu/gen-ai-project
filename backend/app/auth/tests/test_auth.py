@@ -1,26 +1,19 @@
 """
-Tests for Phase 9 - Authentication & Authorization.
+Tests for Authentication.
 
 Password hashing and JWT tests are pure/unit (no DB, no network).
-user_store tests run against the live `users` table (Phase 3 database),
-each using a unique throwaway email and cleaning up after itself so the
-suite is safely re-runnable.
+user store tests run against the live `users` table, each using a unique
+throwaway email and cleaning up after itself so the suite is safely
+re-runnable.
 """
 
-import sys
 import uuid
-from pathlib import Path
 
 import jwt
 import pytest
 
-PHASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PHASE_DIR))
-sys.path.insert(0, str(PHASE_DIR.parent / "phase3_storage_indexing"))
-
-import auth  # noqa: E402
-import user_store  # noqa: E402
-from db import get_connection  # noqa: E402
+from app.auth import password_reset, tokens as auth, users as user_store
+from app.storage.db import get_connection
 
 
 # --- Password hashing ---------------------------------------------------
@@ -174,3 +167,79 @@ def test_get_user_by_id_returns_user(throwaway_email):
 
 def test_get_user_by_id_returns_none_for_unknown_id():
     assert user_store.get_user_by_id(-1) is None
+
+
+def test_get_user_by_email_returns_user(throwaway_email):
+    created = user_store.create_user(throwaway_email, "password123")
+
+    fetched = user_store.get_user_by_email(throwaway_email)
+    assert fetched["id"] == created["id"]
+
+
+def test_get_user_by_email_returns_none_for_unknown_email():
+    assert user_store.get_user_by_email("nobody-registered@example.com") is None
+
+
+def test_set_password_updates_hash_and_old_password_stops_working(throwaway_email):
+    created = user_store.create_user(throwaway_email, "old-password123")
+
+    user_store.set_password(created["id"], "new-password456")
+
+    with pytest.raises(user_store.InvalidCredentialsError):
+        user_store.authenticate_user(throwaway_email, "old-password123")
+    assert user_store.authenticate_user(throwaway_email, "new-password456")["id"] == created["id"]
+
+
+# --- password_reset (live DB) ----------------------------------------------
+
+
+@pytest.fixture
+def registered_user(throwaway_email):
+    return user_store.create_user(throwaway_email, "original-password123")
+
+
+def test_create_and_consume_reset_token_roundtrip(registered_user):
+    token = password_reset.create_reset_token(registered_user["id"])
+
+    user_id = password_reset.consume_reset_token(token)
+    assert user_id == registered_user["id"]
+
+
+def test_consume_unknown_token_is_rejected():
+    with pytest.raises(password_reset.InvalidResetTokenError):
+        password_reset.consume_reset_token("not-a-real-token")
+
+
+def test_consume_same_token_twice_is_rejected(registered_user):
+    token = password_reset.create_reset_token(registered_user["id"])
+    password_reset.consume_reset_token(token)
+
+    with pytest.raises(password_reset.InvalidResetTokenError):
+        password_reset.consume_reset_token(token)
+
+
+def test_consume_expired_token_is_rejected(registered_user):
+    token = password_reset.create_reset_token(registered_user["id"])
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "update password_reset_tokens set expires_at = now() - interval '1 minute' "
+                "where user_id = %s;",
+                (registered_user["id"],),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(password_reset.InvalidResetTokenError):
+        password_reset.consume_reset_token(token)
+
+
+def test_requesting_a_new_token_invalidates_the_previous_one(registered_user):
+    first_token = password_reset.create_reset_token(registered_user["id"])
+    password_reset.create_reset_token(registered_user["id"])  # supersedes first_token
+
+    with pytest.raises(password_reset.InvalidResetTokenError):
+        password_reset.consume_reset_token(first_token)

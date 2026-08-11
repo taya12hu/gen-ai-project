@@ -1,19 +1,15 @@
 """
-Phase 9 - Authentication & Authorization.
+Authentication - schema setup.
 
-Applies schema.sql (users table) to the configured Postgres database.
-Safe to re-run: uses `if not exists`.
+Applies schema.sql (users + password_reset_tokens tables) to the configured
+Postgres database. Safe to re-run: uses `if not exists`.
 """
 
-import sys
 from pathlib import Path
 
-PHASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(PHASE_DIR.parent / "phase3_storage_indexing"))
+from app.storage.db import get_connection
 
-from db import get_connection  # noqa: E402
-
-SCHEMA_SQL = PHASE_DIR / "schema.sql"
+SCHEMA_SQL = Path(__file__).resolve().parent / "schema.sql"
 
 
 def main() -> None:
