@@ -26,7 +26,7 @@ invent a restaurant or a claim that isn't backed by the data it was given.
 flowchart TD
     U[User's message] --> QU[Understand the message<br/>AI reads it for filters, vibe, and references]
     QU -->|place, cuisine, price, rating| SF[Filter restaurants in the database]
-    QU -->|descriptive vibe, e.g. "quiet", "good for a date"| VEC[(Search reviews by meaning)]
+    QU -->|descriptive vibe, like quiet or good for a date| VEC[(Search reviews by meaning)]
     QU -->|refers to an earlier restaurant| REF[Work out which restaurant<br/>from earlier in this chat]
     SF --> HYB[Combine into one shortlist]
     VEC --> HYB
