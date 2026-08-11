@@ -3,10 +3,13 @@ backend/.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+backend/*.egg-info/
+backend/dump.log*
+backend/*.log
 
-# Data (raw/processed datasets — regenerate via each phase's script, don't commit large files)
-backend/phase1_data_acquisition/data/raw/*.csv
-backend/phase2_data_cleaning/data/processed/*.csv
+# Data (raw/processed datasets — regenerate via app.data.acquisition/cleaning, don't commit large files)
+backend/data/raw/*.csv
+backend/data/processed/*.csv
 
 # Env / secrets
 .env
