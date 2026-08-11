@@ -1,25 +1,20 @@
 """
-Tests for Phase 10 - Application / Interface Layer (backend API).
+Tests for the Application / Interface Layer (backend API).
 
 Uses FastAPI's TestClient against the real app, which in turn hits the
-live database, Groq API, and Phase 9 auth logic - this exercises the full
-wired-together pipeline through the actual HTTP interface, including that
-/recommend is now behind a login requirement.
+live database, Groq API, and the auth domain's logic - this exercises the
+full wired-together pipeline through the actual HTTP interface.
 """
 
-import sys
+import os
 import uuid
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-PHASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PHASE_DIR))
-sys.path.insert(0, str(PHASE_DIR.parent / "phase3_storage_indexing"))
-
-from api import app  # noqa: E402
-from db import get_connection  # noqa: E402
+from app.api.main import app
+from app.auth import password_reset
+from app.storage.db import get_connection
 
 client = TestClient(app)
 
@@ -43,24 +38,13 @@ def auth_headers():
         conn.close()
 
 
-# --- Health / options (unauthenticated) --------------------------------------
+# --- Health --------------------------------------------------------------------
 
 
 def test_health_check():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-
-
-def test_options_returns_places_and_cuisines():
-    response = client.get("/options")
-    assert response.status_code == 200
-
-    data = response.json()
-    assert "Indiranagar" in data["places"]
-    assert "Chinese" in data["cuisines"]
-    assert len(data["places"]) > 0
-    assert len(data["cuisines"]) > 0
 
 
 # --- Auth: register / login / me ----------------------------------------------
@@ -150,143 +134,177 @@ def test_me_with_invalid_token_returns_401():
     assert response.status_code == 401
 
 
-# --- /recommend: auth requirement ---------------------------------------------
+# --- Auth: forgot / reset password ---------------------------------------------
+
+RESEND_CONFIGURED = bool(os.environ.get("RESEND_API_KEY"))
 
 
-def test_recommend_without_token_returns_401():
-    response = client.post(
-        "/recommend",
-        json={"place": "Indiranagar", "cuisines": ["Chinese"], "max_price": 800, "min_rating": 4.0},
-    )
-    assert response.status_code == 401
-
-
-def test_recommend_with_invalid_token_returns_401():
-    response = client.post(
-        "/recommend",
-        json={"place": "Indiranagar", "cuisines": ["Chinese"], "max_price": 800, "min_rating": 4.0},
-        headers={"Authorization": "Bearer not-a-real-token"},
-    )
-    assert response.status_code == 401
-
-
-# --- /recommend: behavior once authenticated ----------------------------------
-
-
-def test_recommend_valid_request_returns_matched_restaurants(auth_headers):
-    response = client.post(
-        "/recommend",
-        json={"place": "Indiranagar", "cuisines": ["Chinese"], "max_price": 800, "min_rating": 4.0},
-        headers=auth_headers,
-    )
+def test_forgot_password_for_unknown_email_returns_generic_message():
+    # No RESEND_API_KEY needed here - an unregistered email returns before
+    # the email service would ever be called (see forgot_password in api.py).
+    response = client.post("/auth/forgot-password", json={"email": "nobody-registered@example.com"})
     assert response.status_code == 200
-
-    data = response.json()
-    assert data["found_any"] is True
-    assert data["relaxed"] is False
-    assert len(data["matched_restaurants"]) > 0
-    assert len(data["explanation"]) > 0
-    assert len(data["display_text"]) > 0
-
-    for r in data["matched_restaurants"]:
-        assert r["place"] == "Indiranagar"
-        assert "Chinese" in r["cuisines"]
-        assert r["price"] <= 800
-        assert r["rating"] >= 4.0
+    assert "If an account with that email exists" in response.json()["message"]
 
 
-def test_recommend_is_case_insensitive_on_place_and_cuisine(auth_headers):
-    response = client.post(
-        "/recommend",
-        json={"place": "indiranagar", "cuisines": ["chinese"], "max_price": 800, "min_rating": 4.0},
-        headers=auth_headers,
-    )
+@pytest.mark.skipif(not RESEND_CONFIGURED, reason="RESEND_API_KEY not configured in this environment")
+def test_forgot_password_for_known_email_creates_a_reset_token(auth_headers):
+    me = client.get("/auth/me", headers=auth_headers).json()
+
+    response = client.post("/auth/forgot-password", json={"email": me["email"]})
     assert response.status_code == 200
-    data = response.json()
-    assert data["found_any"] is True
-    if data["matched_restaurants"]:
-        assert data["matched_restaurants"][0]["place"] == "Indiranagar"
+    assert "If an account with that email exists" in response.json()["message"]
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select count(*) from password_reset_tokens where user_id = %s and used_at is null;",
+                (me["id"],),
+            )
+            assert cur.fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
-def test_recommend_unknown_place_returns_400(auth_headers):
+def test_reset_password_with_invalid_token_returns_400():
     response = client.post(
-        "/recommend",
-        json={"place": "Atlantis", "cuisines": ["Chinese"], "max_price": 800, "min_rating": 4.0},
-        headers=auth_headers,
+        "/auth/reset-password", json={"token": "not-a-real-token", "new_password": "newpassword123"}
     )
     assert response.status_code == 400
-    assert "Atlantis" in response.json()["detail"]
 
 
-def test_recommend_unknown_cuisine_returns_400(auth_headers):
+def test_reset_password_updates_password_and_allows_login(auth_headers):
+    # Issues the token directly (bypassing /auth/forgot-password) so this test
+    # doesn't depend on RESEND_API_KEY being configured - it's exercising the
+    # reset endpoint itself, not email delivery.
+    me = client.get("/auth/me", headers=auth_headers).json()
+    token = password_reset.create_reset_token(me["id"])
+
     response = client.post(
-        "/recommend",
-        json={"place": "Indiranagar", "cuisines": ["Klingon"], "max_price": 800, "min_rating": 4.0},
-        headers=auth_headers,
-    )
-    assert response.status_code == 400
-    assert "Klingon" in response.json()["detail"]
-
-
-@pytest.mark.parametrize(
-    "field, value",
-    [
-        ("max_price", -100),
-        ("max_price", 0),
-        ("min_rating", -1),
-        ("min_rating", 10),
-    ],
-)
-def test_recommend_out_of_range_values_return_422(auth_headers, field, value):
-    payload = {"place": "Indiranagar", "cuisines": ["Chinese"], "max_price": 800, "min_rating": 4.0}
-    payload[field] = value
-
-    response = client.post("/recommend", json=payload, headers=auth_headers)
-    assert response.status_code == 422
-
-
-def test_recommend_missing_place_returns_422(auth_headers):
-    response = client.post(
-        "/recommend",
-        json={"cuisines": ["Chinese"], "max_price": 800, "min_rating": 4.0},
-        headers=auth_headers,
-    )
-    assert response.status_code == 422
-
-
-def test_recommend_empty_cuisines_list_returns_422(auth_headers):
-    response = client.post(
-        "/recommend",
-        json={"place": "Indiranagar", "cuisines": [], "max_price": 800, "min_rating": 4.0},
-        headers=auth_headers,
-    )
-    assert response.status_code == 422
-
-
-def test_recommend_without_price_or_rating_still_returns_results(auth_headers):
-    response = client.post(
-        "/recommend",
-        json={"place": "Indiranagar", "cuisines": ["Chinese"]},
-        headers=auth_headers,
+        "/auth/reset-password", json={"token": token, "new_password": "brand-new-password123"}
     )
     assert response.status_code == 200
-    data = response.json()
-    assert data["found_any"] is True
 
-
-def test_recommend_with_multiple_cuisines_matches_any(auth_headers):
-    response = client.post(
-        "/recommend",
-        json={"place": "Indiranagar", "cuisines": ["Chinese", "Cafe"], "max_price": 2000, "min_rating": 0},
-        headers=auth_headers,
+    login_response = client.post(
+        "/auth/login", json={"email": me["email"], "password": "brand-new-password123"}
     )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["found_any"] is True
-    for r in data["matched_restaurants"]:
-        assert "Chinese" in r["cuisines"] or "Cafe" in r["cuisines"]
+    assert login_response.status_code == 200
+
+
+def test_reset_password_token_cannot_be_reused(auth_headers):
+    me = client.get("/auth/me", headers=auth_headers).json()
+    token = password_reset.create_reset_token(me["id"])
+
+    first = client.post("/auth/reset-password", json={"token": token, "new_password": "first-new-pass123"})
+    assert first.status_code == 200
+
+    second = client.post("/auth/reset-password", json={"token": token, "new_password": "second-new-pass123"})
+    assert second.status_code == 400
 
 
 def test_cors_headers_present_for_allowed_origin():
     response = client.get("/health", headers={"Origin": "http://localhost:5173"})
     assert response.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+# --- Chat routes -----------------------------------------------------------------
+
+
+def test_create_conversation_requires_auth():
+    response = client.post("/chat/conversations")
+    assert response.status_code == 401
+
+
+def test_create_conversation_returns_201(auth_headers):
+    response = client.post("/chat/conversations", headers=auth_headers)
+    assert response.status_code == 201
+    assert "id" in response.json()
+
+
+def test_list_conversations_only_shows_own(auth_headers):
+    created = client.post("/chat/conversations", headers=auth_headers).json()
+
+    response = client.get("/chat/conversations", headers=auth_headers)
+    assert response.status_code == 200
+    ids = [c["id"] for c in response.json()]
+    assert created["id"] in ids
+
+
+def test_get_messages_for_unknown_conversation_returns_404(auth_headers):
+    response = client.get("/chat/conversations/999999999/messages", headers=auth_headers)
+    assert response.status_code == 404
+
+
+def test_send_message_to_unknown_conversation_returns_404(auth_headers):
+    response = client.post(
+        "/chat/conversations/999999999/messages", json={"message": "hi"}, headers=auth_headers
+    )
+    assert response.status_code == 404
+
+
+def test_send_message_without_auth_returns_401():
+    response = client.post("/chat/conversations/1/messages", json={"message": "hi"})
+    assert response.status_code == 401
+
+
+def test_send_message_requires_nonempty_message(auth_headers):
+    created = client.post("/chat/conversations", headers=auth_headers).json()
+    response = client.post(
+        f"/chat/conversations/{created['id']}/messages", json={"message": ""}, headers=auth_headers
+    )
+    assert response.status_code == 422
+
+
+def test_full_chat_turn_returns_reply_and_persists_history(auth_headers):
+    created = client.post("/chat/conversations", headers=auth_headers).json()
+
+    response = client.post(
+        f"/chat/conversations/{created['id']}/messages",
+        json={"message": "Suggest a good Chinese restaurant in Indiranagar under 800"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["conversation_id"] == created["id"]
+    assert len(data["reply"]) > 0
+
+    history = client.get(f"/chat/conversations/{created['id']}/messages", headers=auth_headers).json()
+    assert [m["role"] for m in history] == ["user", "assistant"]
+
+
+def test_second_users_conversation_is_not_visible_to_first(auth_headers):
+    other_email = f"test-{uuid.uuid4().hex[:12]}@example.com"
+    other_response = client.post(
+        "/auth/register", json={"email": other_email, "password": "password123"}
+    )
+    other_headers = {"Authorization": f"Bearer {other_response.json()['access_token']}"}
+
+    try:
+        other_conversation = client.post("/chat/conversations", headers=other_headers).json()
+
+        response = client.get(
+            f"/chat/conversations/{other_conversation['id']}/messages", headers=auth_headers
+        )
+        assert response.status_code == 404
+    finally:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("delete from users where email = %s;", (other_email,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def test_recommend_endpoint_no_longer_exists():
+    response = client.post(
+        "/recommend",
+        json={"place": "Indiranagar", "cuisines": ["Chinese"]},
+    )
+    assert response.status_code == 404
+
+
+def test_options_endpoint_no_longer_exists():
+    response = client.get("/options")
+    assert response.status_code == 404
