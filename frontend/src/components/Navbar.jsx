@@ -1,6 +1,7 @@
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import Button from './Button'
+import BrandLogo from './BrandLogo'
 import './Navbar.css'
 
 export default function Navbar() {
@@ -15,7 +16,8 @@ export default function Navbar() {
   return (
     <nav className="navbar" aria-label="Main navigation">
       <Link to="/" className="brand">
-        Restaurant Recommender
+        <BrandLogo size={28} />
+        DineMind
       </Link>
 
       {isAuthenticated ? (

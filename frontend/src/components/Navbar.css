@@ -1,14 +1,21 @@
 .navbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
-  padding: var(--space-4) var(--space-5);
-  border-bottom: 1px solid var(--border);
+  padding: var(--space-3) var(--space-5);
+  background: var(--surface);
+  box-shadow: 0 1px 0 var(--border), 0 8px 24px -16px rgba(20, 17, 24, 0.15);
   flex-wrap: wrap;
 }
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
   font-weight: 700;
   font-size: 17px;
   color: var(--text-h);
@@ -28,16 +35,19 @@
 
 .nav-link {
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--text-h);
   text-decoration: none;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-pill);
 }
 
 .nav-link:hover {
   color: var(--accent);
+  background: var(--accent-bg);
 }
 
-@media (max-width: 480px) {
+@media (max-width: 640px) {
   .navbar {
     justify-content: center;
     text-align: center;

@@ -1,0 +1,12 @@
+.brand-logo-mark {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  line-height: 0;
+}
+
+.brand-logo-flame {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
