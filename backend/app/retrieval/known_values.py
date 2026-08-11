@@ -1,16 +1,13 @@
 """
-Phase 4 - Preference Input Layer.
+Retrieval - known place/cuisine values.
 
 Fetches the set of place and cuisine values that actually exist in the
-restaurants table (Phase 3). Used to validate/normalize incoming user
-preferences against real data instead of trusting free-text input blindly.
+restaurants table. Used by query understanding to snap free-text place/
+cuisine mentions in a chat message to canonical DB casing (see
+app.query_understanding).
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "phase3_storage_indexing"))
-from db import get_connection  # noqa: E402
+from app.storage.db import get_connection
 
 
 def get_known_places() -> set[str]:
