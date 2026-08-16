@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.llm.gemini_client import get_json_completion_gemini
 
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 logger = logging.getLogger(__name__)
 

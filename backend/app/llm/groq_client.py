@@ -16,7 +16,7 @@ from groq import Groq
 
 from app.llm.gemini_client import get_recommendation_gemini, stream_recommendation_gemini
 
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 logger = logging.getLogger(__name__)
 
