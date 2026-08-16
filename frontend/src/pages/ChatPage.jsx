@@ -274,7 +274,7 @@ export default function ChatPage() {
           </button>
         </div>
 
-        <div className="chat-sidebar-scroll">
+        <div className="chat-sidebar-pinned">
           <Button className="btn-block" onClick={closeSidebarAnd(startNewChat)}>
             + New chat
           </Button>
@@ -292,6 +292,9 @@ export default function ChatPage() {
               aria-label="Search conversations"
             />
           </div>
+        </div>
+
+        <div className="chat-sidebar-scroll">
           {conversationGroups.size === 0 && searchQuery.trim() && (
             <p className="chat-search-empty">No chats match "{searchQuery.trim()}"</p>
           )}
