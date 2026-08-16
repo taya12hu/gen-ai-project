@@ -28,6 +28,7 @@ codebase (or any library it calls into) had to change for this.
 
 import logging
 import os
+import threading
 
 from psycopg2.extensions import connection as _Psycopg2Connection
 from psycopg2.pool import PoolError, ThreadedConnectionPool
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 MIN_POOL_SIZE = 1
 MAX_POOL_SIZE = 10
+CONNECT_TIMEOUT_SECONDS = 10
 
 
 class _PoolConnection(_Psycopg2Connection):
@@ -65,21 +67,39 @@ class _PoolConnection(_Psycopg2Connection):
             self._pc_returning = False
 
 
-_pool = ThreadedConnectionPool(
-    MIN_POOL_SIZE,
-    MAX_POOL_SIZE,
-    host=os.environ["PGHOST"],
-    port=os.environ["PGPORT"],
-    dbname=os.environ["PGDATABASE"],
-    user=os.environ["PGUSER"],
-    password=os.environ["PGPASSWORD"],
-    connection_factory=_PoolConnection,
-)
+# Built lazily (on first get_connection(), not on import) so a slow or
+# unreachable database can't block app startup - psycopg2.connect() has no
+# default timeout, and this module is imported transitively by
+# app.api.main, which uvicorn loads before it binds to $PORT. Eagerly
+# constructing the pool here used to make the whole process hang mid-import
+# whenever the database was slow to respond, so uvicorn never got the chance
+# to open a port at all.
+_pool: ThreadedConnectionPool | None = None
+_pool_init_lock = threading.Lock()
+
+
+def _get_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_init_lock:
+            if _pool is None:
+                _pool = ThreadedConnectionPool(
+                    MIN_POOL_SIZE,
+                    MAX_POOL_SIZE,
+                    host=os.environ["PGHOST"],
+                    port=os.environ["PGPORT"],
+                    dbname=os.environ["PGDATABASE"],
+                    user=os.environ["PGUSER"],
+                    password=os.environ["PGPASSWORD"],
+                    connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                    connection_factory=_PoolConnection,
+                )
+    return _pool
 
 
 def get_connection():
     try:
-        return _pool.getconn()
+        return _get_pool().getconn()
     except PoolError:
         logger.warning("Connection pool exhausted (max=%d) while acquiring a connection", MAX_POOL_SIZE)
         raise
