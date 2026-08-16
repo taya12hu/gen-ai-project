@@ -47,9 +47,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI Restaurant Recommendation Service")
 
+# Local dev origins are always allowed; FRONTEND_URL (already used for
+# password-reset links) adds the deployed frontend's origin in production.
+_allow_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+_frontend_url = os.environ.get("FRONTEND_URL")
+if _frontend_url and _frontend_url not in _allow_origins:
+    _allow_origins.append(_frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_allow_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
