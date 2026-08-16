@@ -81,7 +81,15 @@ def clean_text(value) -> str | None:
 
 
 def parse_reviews(raw_value: str) -> list[tuple[float | None, str]]:
-    """One reviews_list cell -> [(review_rating, review_text), ...], skipping blanks."""
+    """One reviews_list cell -> [(review_rating, review_text), ...], skipping blanks.
+
+    The raw Zomato export repeats every review in a restaurant's cell several
+    times over (verified: some restaurants have each review tripled) - almost
+    certainly an artifact of how the source scrape was assembled, not real
+    signal. Deduplicated by cleaned text here, at the point where duplicates
+    are first visible, so nothing downstream (ranking, capping, snippet
+    selection) has to special-case it.
+    """
     if pd.isna(raw_value):
         return []
     try:
@@ -90,10 +98,12 @@ def parse_reviews(raw_value: str) -> list[tuple[float | None, str]]:
         return []
 
     reviews = []
+    seen_text: set[str] = set()
     for rating_str, text in parsed:
         clean = RATED_PREFIX_PATTERN.sub("", str(text)).strip()
-        if not clean:
+        if not clean or clean in seen_text:
             continue
+        seen_text.add(clean)
         rating_match = REVIEW_RATING_PATTERN.match(str(rating_str).strip()) if rating_str else None
         rating = float(rating_match.group(1)) if rating_match else None
         reviews.append((rating, clean))
