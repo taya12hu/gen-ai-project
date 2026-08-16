@@ -38,11 +38,24 @@ def send_password_reset_email(to_email: str, reset_url: str) -> None:
             "from": from_email,
             "to": [to_email],
             "subject": "Reset your password",
+            # Some mail clients only render the text/plain part of a message
+            # that lacks one, which showed up as a genuinely blank email in
+            # production even though Resend accepted and delivered it fine -
+            # both parts are required, not just html, for the message body
+            # to reliably show up across clients.
             "html": (
+                "<!DOCTYPE html><html><body>"
                 "<p>Someone requested a password reset for this account.</p>"
                 f'<p><a href="{reset_url}">Click here to reset your password</a>. '
                 "This link expires in 30 minutes.</p>"
                 "<p>If you didn't request this, you can safely ignore this email.</p>"
+                "</body></html>"
+            ),
+            "text": (
+                "Someone requested a password reset for this account.\n\n"
+                f"Reset your password: {reset_url}\n"
+                "This link expires in 30 minutes.\n\n"
+                "If you didn't request this, you can safely ignore this email."
             ),
         },
         timeout=10.0,
