@@ -48,10 +48,18 @@ logger = logging.getLogger(__name__)
 HISTORY_LIMIT = 10
 SEARCH_LIMIT = 5
 
-# Preference keys folded into the semantic ("vibe") side of retrieval rather
-# than a hard SQL filter, per the soft-default design: a stored fact should
-# bias what gets surfaced, but a one-off request in the current message can
-# still override it.
+# Preference keys eligible to fold into the semantic ("vibe") side of
+# retrieval rather than a hard SQL filter, per the soft-default design: a
+# stored fact should bias what gets surfaced, but a one-off request in the
+# current message can still override it.
+#
+# Being *eligible* doesn't mean a given preference is applied to every turn,
+# though - query understanding (see relevant_preference_keys below) decides
+# per-message whether a specific stored fact is actually relevant to what
+# was just asked. Unconditionally gluing every remembered preference onto
+# every search used to silently skew unrelated requests (e.g. a stored
+# "healthier" preference narrowing an unrelated "late-night meal" search)
+# with no way for the user to know why.
 VIBE_PREFERENCE_KEYS = {"dietary", "ambience", "occasion", "vibe"}
 
 
@@ -68,6 +76,7 @@ class PreparedChatTurn:
     prompt: list[dict]
     candidates: list
     referenced_restaurant: object | None
+    new_preferences: dict[str, str]
 
 
 def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -> PreparedChatTurn:
@@ -85,14 +94,23 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
     logger.info("Preparing chat turn for user_id=%s conversation_id=%s", user_id, conversation_id)
     recent_messages = get_messages(conversation_id, limit=HISTORY_LIMIT)
     preferences = get_preferences(user_id)
+    vibe_preferences = {k: v for k, v in preferences.items() if k in VIBE_PREFERENCE_KEYS}
 
     known_places = get_known_places()
     known_cuisines = get_known_cuisines()
-    understanding = understand_query(message, recent_messages, known_places, known_cuisines)
+    understanding = understand_query(message, recent_messages, known_places, known_cuisines, vibe_preferences)
 
     if understanding.new_preferences:
         upsert_preferences(user_id, understanding.new_preferences)
         preferences = {**preferences, **understanding.new_preferences}
+
+    # Only the subset query understanding judged relevant to *this* message,
+    # not everything ever stored - this is what actually gets applied to
+    # retrieval and shown to the user as "used for this search" (see
+    # build_chat_prompt). A preference that exists but wasn't judged
+    # relevant this turn is simply not in play for this turn; it can still
+    # surface on a later turn where it genuinely applies.
+    applied_preferences = {k: v for k, v in vibe_preferences.items() if k in understanding.relevant_preference_keys}
 
     candidates: list = []
     referenced_restaurant = None
@@ -102,7 +120,7 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         prior_ids = get_last_mentioned_restaurant_ids(conversation_id)
         if prior_ids:
             referenced_restaurant = get_reviews_for_restaurant(
-                prior_ids[0], _effective_vibe_query(understanding.vibe_query, preferences)
+                prior_ids[0], _effective_vibe_query(understanding.vibe_query, applied_preferences)
             )
         else:
             understanding.intent = "search"  # nothing to refer back to - fall through to a fresh search
@@ -117,13 +135,13 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
             min_rating=understanding.min_rating,
         )
         result = get_hybrid_candidates(
-            filters, _effective_vibe_query(understanding.vibe_query, preferences), limit=SEARCH_LIMIT
+            filters, _effective_vibe_query(understanding.vibe_query, applied_preferences), limit=SEARCH_LIMIT
         )
         candidates = result.candidates
         relaxed = result.relaxed
 
     prompt = build_chat_prompt(
-        message, understanding, candidates, relaxed, recent_messages, preferences, referenced_restaurant
+        message, understanding, candidates, relaxed, recent_messages, applied_preferences, referenced_restaurant
     )
 
     return PreparedChatTurn(
@@ -132,6 +150,7 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         prompt=prompt,
         candidates=candidates,
         referenced_restaurant=referenced_restaurant,
+        new_preferences=understanding.new_preferences,
     )
 
 
@@ -143,7 +162,12 @@ def finalize_chat_turn(prepared: PreparedChatTurn, llm_text: str) -> ChatReply:
     matching_pool = (
         [prepared.referenced_restaurant] if prepared.referenced_restaurant is not None else prepared.candidates
     )
-    reply = format_chat_reply(matching_pool, llm_text, force_match=prepared.referenced_restaurant is not None)
+    reply = format_chat_reply(
+        matching_pool,
+        llm_text,
+        force_match=prepared.referenced_restaurant is not None,
+        new_preferences=prepared.new_preferences,
+    )
 
     add_message(prepared.conversation_id, "user", prepared.message)
     add_message(
