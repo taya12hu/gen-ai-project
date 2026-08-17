@@ -8,6 +8,7 @@ const ERROR_MESSAGES = {
   llm_unavailable: 'Our AI assistant is temporarily unavailable. Please try again in a few minutes.',
   database_unavailable: "We're having trouble connecting right now. Please try again in a moment.",
   conversation_not_found: "This conversation couldn't be found - starting a new one.",
+  preference_not_found: 'That preference was already removed.',
 }
 
 export const SESSION_EXPIRED_MESSAGE = 'Your session has expired. Please log in again.'
