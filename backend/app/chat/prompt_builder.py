@@ -2,11 +2,16 @@
 Chat Prompt Construction.
 
 Turns a QueryUnderstanding + retrieved candidates (already grounded -
-structured facts + real review snippets) + prior turns + remembered
-preferences into a Groq chat message list. Prior turns are passed through
-as real user/assistant messages (native multi-turn), not flattened into
-text - only the *current* turn carries the retrieval context, appended to
-the latest user message.
+structured facts + real review snippets) + prior turns + the preferences
+actually applied to this turn into a Groq chat message list. Prior turns are
+passed through as real user/assistant messages (native multi-turn), not
+flattened into text - only the *current* turn carries the retrieval context,
+appended to the latest user message.
+
+`preferences` here is deliberately the *applied* subset for this turn (see
+app.chat.service.prepare_chat_turn), not everything ever remembered about
+the user - the LLM is told about a preference only when it actually shaped
+this search, so it never claims to have used something it didn't.
 """
 
 SYSTEM_PROMPT = """
@@ -36,6 +41,11 @@ Rules:
    briefly and invite a restaurant question.
 7. Keep replies conversational and concise - this is a chat, not a report.
    Refer to restaurants by name exactly as given.
+8. If a "Preferences applied to this search" section is given below, those
+   remembered facts genuinely shaped which restaurants you're seeing - say
+   so plainly and briefly (e.g. "Since you mentioned preferring vegetarian
+   food, I focused on..."). Never claim a preference was used if that
+   section isn't present.
 """.strip()
 
 
@@ -74,7 +84,7 @@ def build_chat_prompt(
 
     if preferences:
         pref_lines = "\n".join(f"- {k}: {v}" for k, v in preferences.items())
-        context_parts.append(f"Remembered preferences for this user (soft defaults, not hard filters):\n{pref_lines}")
+        context_parts.append(f"Preferences applied to this search:\n{pref_lines}")
 
     if referenced_restaurant is not None:
         context_parts.append("Restaurant being discussed:\n" + _format_candidate(referenced_restaurant, 1))
