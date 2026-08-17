@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, Navigate, useNavigate, useSearchParams } from 'react-router-dom'
-import { Bookmark, Filter, MessagesSquare, Target } from 'lucide-react'
+import { MessagesSquare, Target } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import { friendlyErrorMessage, SESSION_EXPIRED_MESSAGE } from '../lib/errorMessages'
 import Card from '../components/Card'
@@ -27,8 +27,6 @@ export default function LoginPage() {
   const features = [
     { icon: Target, label: 'AI Recommendations', desc: 'Smart suggestions just for you' },
     { icon: MessagesSquare, label: 'Real Reviews', desc: 'Insights from real diners' },
-    { icon: Filter, label: 'Personalized Filters', desc: 'Taste, mood, budget – you choose' },
-    { icon: Bookmark, label: 'Save & Go', desc: 'Save favorites and plan your next meal' },
   ]
 
   async function handleSubmit(e) {
