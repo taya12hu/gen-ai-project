@@ -1,3 +1,5 @@
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import RestaurantCard from './RestaurantCard'
 import './ChatMessageBubble.css'
 
@@ -8,7 +10,13 @@ export default function ChatMessageBubble({ message }) {
   return (
     <div className={`chat-bubble-row ${isUser ? 'chat-bubble-row-user' : ''}`}>
       <div className={`chat-bubble ${isUser ? 'chat-bubble-user' : 'chat-bubble-assistant'}`}>
-        <p>{message.content}</p>
+        {isUser ? (
+          <p>{message.content}</p>
+        ) : (
+          <div className="chat-bubble-markdown">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+          </div>
+        )}
       </div>
       {!isUser && restaurants.length > 0 && (
         <div className="chat-bubble-restaurants">

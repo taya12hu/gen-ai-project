@@ -22,6 +22,93 @@
   margin: 0;
 }
 
+.chat-bubble-markdown {
+  white-space: normal;
+}
+
+.chat-bubble-markdown > *:first-child {
+  margin-top: 0;
+}
+
+.chat-bubble-markdown > *:last-child {
+  margin-bottom: 0;
+}
+
+.chat-bubble-markdown p,
+.chat-bubble-markdown ul,
+.chat-bubble-markdown ol {
+  margin: 0 0 var(--space-2);
+}
+
+.chat-bubble-markdown ul,
+.chat-bubble-markdown ol {
+  padding-left: 1.25em;
+}
+
+.chat-bubble-markdown h1,
+.chat-bubble-markdown h2,
+.chat-bubble-markdown h3,
+.chat-bubble-markdown h4 {
+  margin: var(--space-3) 0 var(--space-2);
+  line-height: 1.3;
+}
+
+.chat-bubble-markdown h1 {
+  font-size: 1.25em;
+}
+
+.chat-bubble-markdown h2 {
+  font-size: 1.15em;
+}
+
+.chat-bubble-markdown h3,
+.chat-bubble-markdown h4 {
+  font-size: 1.05em;
+}
+
+.chat-bubble-markdown code {
+  background: var(--accent-bg, rgba(0, 0, 0, 0.06));
+  border-radius: var(--radius-sm, 4px);
+  padding: 0.1em 0.35em;
+  font-size: 0.9em;
+}
+
+.chat-bubble-markdown pre {
+  background: var(--accent-bg, rgba(0, 0, 0, 0.06));
+  border-radius: var(--radius-sm, 4px);
+  padding: var(--space-2);
+  overflow-x: auto;
+  margin: 0 0 var(--space-2);
+}
+
+.chat-bubble-markdown pre code {
+  background: none;
+  padding: 0;
+}
+
+.chat-bubble-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0 0 var(--space-2);
+  font-size: 0.95em;
+}
+
+.chat-bubble-markdown th,
+.chat-bubble-markdown td {
+  border: 1px solid var(--accent-border, rgba(0, 0, 0, 0.15));
+  padding: var(--space-1, 4px) var(--space-2);
+  text-align: left;
+}
+
+.chat-bubble-markdown blockquote {
+  margin: 0 0 var(--space-2);
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--accent-border, rgba(0, 0, 0, 0.15));
+  color: var(--text-muted, inherit);
+}
+
 .chat-bubble-user {
   background: var(--accent-bg);
   border: 1px solid var(--accent-border);
