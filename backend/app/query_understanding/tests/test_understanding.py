@@ -48,6 +48,21 @@ def test_resolve_known_values_is_case_insensitive():
     assert resolved.cuisines == ["Chinese"]
 
 
+def test_clamp_relevant_preference_keys_drops_keys_not_in_input():
+    """A hallucinated/malformed key here would otherwise flow straight into
+    which stored preference gets applied to retrieval (see
+    app.chat.service._effective_vibe_query) - it must never survive."""
+    understanding = qu.QueryUnderstanding(relevant_preference_keys=["dietary", "made_up_key"])
+    clamped = qu._clamp_relevant_preference_keys(understanding, {"dietary": "vegetarian"})
+    assert clamped.relevant_preference_keys == ["dietary"]
+
+
+def test_clamp_relevant_preference_keys_keeps_valid_keys_unchanged():
+    understanding = qu.QueryUnderstanding(relevant_preference_keys=["dietary"])
+    clamped = qu._clamp_relevant_preference_keys(understanding, {"dietary": "vegetarian", "ambience": "quiet"})
+    assert clamped.relevant_preference_keys == ["dietary"]
+
+
 # --- real Groq integration ---------------------------------------------------
 
 
@@ -99,3 +114,28 @@ def test_followup_question_refers_to_previous_restaurant():
 def test_chitchat_intent_for_greeting():
     result = qu.understand_query("hey, how's it going?", [], KNOWN_PLACES, KNOWN_CUISINES)
     assert result.intent == "chitchat"
+
+
+def test_relevant_preference_keys_includes_clearly_applicable_dietary_preference():
+    result = qu.understand_query(
+        "Suggest a good restaurant for dinner",
+        [],
+        KNOWN_PLACES,
+        KNOWN_CUISINES,
+        preferences={"dietary": "vegetarian"},
+    )
+    assert "dietary" in result.relevant_preference_keys
+
+
+def test_relevant_preference_keys_excludes_unrelated_stored_preference():
+    """Reproduces the real bug this feature fixes: a mood/ambience preference
+    from an earlier conversation should not silently narrow an unrelated
+    request just because it exists in storage."""
+    result = qu.understand_query(
+        "Suggest something for a quick solo lunch break",
+        [],
+        KNOWN_PLACES,
+        KNOWN_CUISINES,
+        preferences={"ambience": "quiet, romantic"},
+    )
+    assert "ambience" not in result.relevant_preference_keys

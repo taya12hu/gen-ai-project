@@ -55,6 +55,16 @@ JSON matching this shape, no other text:
       {"ambience": "quiet"}). Do NOT include one-off requests for the
       current message here - only durable statements about the user
       ("I'm vegetarian", "I usually prefer quiet places").
+  "relevant_preference_keys": array of strings - which of the "Remembered
+      preferences" keys below (if any) are actually relevant to interpreting
+      or answering THIS specific message. Only include a key if it should
+      genuinely influence this request, not just because it exists. A
+      dietary restriction is usually relevant to most food requests; a mood/
+      occasion preference from an earlier conversation is often NOT relevant
+      to an unrelated request (e.g. a past "quiet" preference isn't relevant
+      to "suggest something for a quick lunch" unless this message is also
+      about mood/ambience). Empty array if none apply, or if no preferences
+      are listed below.
 }
 
 intent guide:
@@ -69,6 +79,10 @@ Only fill "place"/"cuisines" with values that reasonably match the known
 lists above (case-insensitive match is fine) - if the user's wording
 doesn't clearly match anything known, leave it null/empty rather than
 guessing.
+
+Remembered preferences for this user (previously stated, not necessarily
+related to this message):
+__PREFERENCES__
 """.strip()
 
 
@@ -81,6 +95,7 @@ class QueryUnderstanding(BaseModel):
     vibe_query: str | None = None
     refers_to_previous_restaurant: bool = False
     new_preferences: dict[str, str] = Field(default_factory=dict)
+    relevant_preference_keys: list[str] = Field(default_factory=list)
 
 
 def _get_client() -> Groq:
@@ -105,9 +120,14 @@ def build_messages(
     recent_messages: list[dict],
     known_places: set[str],
     known_cuisines: set[str],
+    preferences: dict[str, str] | None = None,
 ) -> list[dict]:
-    system = SYSTEM_PROMPT.replace("__KNOWN_PLACES__", ", ".join(sorted(known_places))).replace(
-        "__KNOWN_CUISINES__", ", ".join(sorted(known_cuisines))
+    preferences = preferences or {}
+    pref_lines = "\n".join(f"- {k}: {v}" for k, v in preferences.items()) if preferences else "(none stored yet)"
+    system = (
+        SYSTEM_PROMPT.replace("__KNOWN_PLACES__", ", ".join(sorted(known_places)))
+        .replace("__KNOWN_CUISINES__", ", ".join(sorted(known_cuisines)))
+        .replace("__PREFERENCES__", pref_lines)
     )
 
     history_lines = [f"{m['role']}: {m['content']}" for m in recent_messages]
@@ -125,16 +145,28 @@ def build_messages(
     ]
 
 
+def _clamp_relevant_preference_keys(understanding: QueryUnderstanding, preferences: dict[str, str]) -> QueryUnderstanding:
+    """Drop any key the model claimed as relevant that isn't actually one we
+    gave it - a hallucinated or malformed key here would otherwise flow
+    straight into which stored preference gets applied to retrieval."""
+    valid = [k for k in understanding.relevant_preference_keys if k in preferences]
+    if valid == understanding.relevant_preference_keys:
+        return understanding
+    return understanding.model_copy(update={"relevant_preference_keys": valid})
+
+
 def understand_query(
     message: str,
     recent_messages: list[dict],
     known_places: set[str],
     known_cuisines: set[str],
+    preferences: dict[str, str] | None = None,
     model: str | None = None,
 ) -> QueryUnderstanding:
+    preferences = preferences or {}
     client = _get_client()
     resolved_model = model or os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
-    messages = build_messages(message, recent_messages, known_places, known_cuisines)
+    messages = build_messages(message, recent_messages, known_places, known_cuisines, preferences)
 
     try:
         completion = client.chat.completions.create(
@@ -157,9 +189,10 @@ def understand_query(
         understanding = QueryUnderstanding(intent="search", vibe_query=message)
 
     resolved = _resolve_known_values(understanding, known_places, known_cuisines)
+    resolved = _clamp_relevant_preference_keys(resolved, preferences)
     logger.info(
-        "Query understood: intent=%s place=%s cuisines=%s vibe_query=%r refers_to_previous=%s",
+        "Query understood: intent=%s place=%s cuisines=%s vibe_query=%r refers_to_previous=%s relevant_preferences=%s",
         resolved.intent, resolved.place, resolved.cuisines, resolved.vibe_query,
-        resolved.refers_to_previous_restaurant,
+        resolved.refers_to_previous_restaurant, resolved.relevant_preference_keys,
     )
     return resolved
