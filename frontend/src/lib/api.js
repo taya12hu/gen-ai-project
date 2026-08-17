@@ -94,6 +94,14 @@ export function sendChatMessage(conversationId, message, token) {
   })
 }
 
+export function listPreferences(token) {
+  return request('/preferences', { token })
+}
+
+export function deletePreference(key, token) {
+  return request(`/preferences/${encodeURIComponent(key)}`, { method: 'DELETE', token })
+}
+
 // SSE events look like "event: <type>\ndata: <json>\n\n" - each blank line
 // ends one event. fetch()'s reader hands back raw byte chunks that don't
 // line up with event boundaries, so this buffers text until it sees a full
