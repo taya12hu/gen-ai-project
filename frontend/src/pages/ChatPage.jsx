@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { LogOut, Menu, X } from 'lucide-react'
+import { LogOut, Menu, Settings, X } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import {
   ApiError,
@@ -16,7 +16,20 @@ import Spinner from '../components/Spinner'
 import EmptyState from '../components/EmptyState'
 import ChatMessageBubble from '../components/ChatMessageBubble'
 import BrandLogo from '../components/BrandLogo'
+import PreferencesPanel from '../components/PreferencesPanel'
+import { labelFor } from '../lib/preferenceLabels'
 import './ChatPage.css'
+
+// Turns the preference facts captured on this turn (see new_preferences on
+// the "done" stream event / ChatMessageResponse) into a plain-language
+// notice - the only place a user learns a fact was just remembered, since
+// capture itself happens silently mid-conversation.
+function describeNewPreferences(newPreferences) {
+  const entries = Object.entries(newPreferences || {})
+  if (entries.length === 0) return null
+  const parts = entries.map(([key, value]) => `${labelFor(key).toLowerCase()}: ${value}`)
+  return `Noted, I'll remember this - ${parts.join(', ')}.`
+}
 
 // First letter of whatever identifies the user, for the sidebar avatar.
 function avatarInitial(user) {
@@ -89,11 +102,23 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [awaitingFirstToken, setAwaitingFirstToken] = useState(false)
+  const [reconnecting, setReconnecting] = useState(false)
   const [historyLoading, setHistoryLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [notice, setNotice] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [prefsOpen, setPrefsOpen] = useState(false)
 
   const scrollRef = useRef(null)
+  // Tracks the in-flight stream's AbortController so a conversation switch
+  // or unmount can cancel it - otherwise its onToken/onDone callbacks keep
+  // firing after the user has navigated away and write into whatever
+  // conversation happens to be on screen by then.
+  const streamAbortRef = useRef(null)
+
+  useEffect(() => {
+    return () => streamAbortRef.current?.abort()
+  }, [])
 
   // Mobile only (CSS ignores this state above the drawer breakpoint) - keeps
   // the drawer closable with Escape and stops the page scrolling behind it.
@@ -148,6 +173,7 @@ export default function ChatPage() {
   }, [messages, loading])
 
   async function selectConversation(id) {
+    streamAbortRef.current?.abort()
     setError(null)
     setConversationId(id)
     try {
@@ -164,6 +190,7 @@ export default function ChatPage() {
   }
 
   function startNewChat() {
+    streamAbortRef.current?.abort()
     setConversationId(null)
     setMessages([])
     setError(null)
@@ -176,6 +203,7 @@ export default function ChatPage() {
 
     setInput('')
     setError(null)
+    setNotice(null)
     setMessages((prev) => [...prev, { id: `local-${Date.now()}`, role: 'user', content: text }])
     setLoading(true)
     setAwaitingFirstToken(true)
@@ -183,6 +211,20 @@ export default function ChatPage() {
     const replyId = `reply-${Date.now()}`
     let streamedText = ''
     let bubbleStarted = false
+
+    const controller = new AbortController()
+    streamAbortRef.current = controller
+
+    // Drops whatever partial reply the last (failed) attempt had rendered,
+    // so a retry's tokens start a clean bubble instead of getting appended
+    // onto text from a generation that never finished.
+    function discardPartialBubble() {
+      streamedText = ''
+      if (bubbleStarted) {
+        bubbleStarted = false
+        setMessages((prev) => prev.filter((m) => m.id !== replyId))
+      }
+    }
 
     try {
       let convId = conversationId
@@ -197,6 +239,7 @@ export default function ChatPage() {
       }
 
       await sendChatMessageStream(convId, text, token, {
+        signal: controller.signal,
         onToken: (chunk) => {
           streamedText += chunk
           if (!bubbleStarted) {
@@ -205,6 +248,7 @@ export default function ChatPage() {
             // whole thing to finish.
             bubbleStarted = true
             setAwaitingFirstToken(false)
+            setReconnecting(false)
             setMessages((prev) => [
               ...prev,
               { id: replyId, role: 'assistant', content: streamedText, matched_restaurants: [] },
@@ -217,17 +261,28 @@ export default function ChatPage() {
           setMessages((prev) =>
             prev.map((m) => (m.id === replyId ? { ...m, matched_restaurants: data.matched_restaurants } : m))
           )
+          const noticeText = describeNewPreferences(data.new_preferences)
+          if (noticeText) setNotice(noticeText)
+        },
+        onReconnecting: () => {
+          discardPartialBubble()
+          setAwaitingFirstToken(true)
+          setReconnecting(true)
         },
         onError: (err) => {
           throw err
         },
       })
     } catch (err) {
-      if (handleAuthError(err)) {
+      if (err.name === 'AbortError') {
+        // Cancelled deliberately (conversation switch, unmount) - not a
+        // failure, nothing to show the user.
+      } else if (handleAuthError(err)) {
         // The user bubble for this turn stays in local state until the
         // redirect happens - not persisted server-side, but that's fine,
         // logging back in starts a fresh view anyway.
       } else {
+        discardPartialBubble()
         if (err instanceof ApiError && err.errorCode === 'conversation_not_found') {
           setConversations((prev) => prev.filter((c) => c.id !== conversationId))
           setConversationId(null)
@@ -235,8 +290,10 @@ export default function ChatPage() {
         setError(friendlyErrorMessage(err))
       }
     } finally {
+      if (streamAbortRef.current === controller) streamAbortRef.current = null
       setLoading(false)
       setAwaitingFirstToken(false)
+      setReconnecting(false)
     }
   }
 
@@ -327,11 +384,24 @@ export default function ChatPage() {
             <span className="chat-sidebar-name">{user?.display_name || user?.email}</span>
             {user?.display_name && <span className="chat-sidebar-email">{user.email}</span>}
           </span>
+          <button
+            type="button"
+            className="chat-sidebar-logout"
+            onClick={closeSidebarAnd(() => setPrefsOpen(true))}
+            aria-label="Preferences"
+            title="Preferences"
+          >
+            <Settings size={18} />
+          </button>
           <button type="button" className="chat-sidebar-logout" onClick={handleLogout} aria-label="Log out" title="Log out">
             <LogOut size={18} />
           </button>
         </div>
       </aside>
+
+      {prefsOpen && (
+        <PreferencesPanel token={token} onClose={() => setPrefsOpen(false)} onAuthError={handleAuthError} />
+      )}
 
       <div className="chat-main">
         <div className="chat-mobile-header">
@@ -356,6 +426,10 @@ export default function ChatPage() {
           <Toast message={error} duration={8000} onClose={() => setError(null)} />
         )}
 
+        {!error && notice && (
+          <Toast message={notice} variant="info" duration={6000} onClose={() => setNotice(null)} />
+        )}
+
         <div className="chat-messages" ref={scrollRef}>
           {historyLoading ? (
             <div className="chat-history-loading">
@@ -374,8 +448,8 @@ export default function ChatPage() {
 
           {loading && awaitingFirstToken && (
             <div className="chat-typing">
-              <Spinner size={16} label="Thinking" />
-              <span>Thinking…</span>
+              <Spinner size={16} label={reconnecting ? 'Reconnecting' : 'Thinking'} />
+              <span>{reconnecting ? 'Reconnecting…' : 'Thinking…'}</span>
             </div>
           )}
         </div>
