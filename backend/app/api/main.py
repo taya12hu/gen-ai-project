@@ -12,7 +12,7 @@ import os
 import psycopg2
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
 
@@ -34,6 +34,7 @@ from app.chat.service import (
     prepare_chat_turn,
     stream_chat_message_tokens,
 )
+from app.conversation.preferences import delete_preference, list_preferences
 from app.conversation.store import (
     ConversationNotFoundError,
     create_conversation,
@@ -149,6 +150,13 @@ class ChatMessageResponse(BaseModel):
     conversation_id: int
     reply: str
     matched_restaurants: list[MatchedRestaurantOut]
+    new_preferences: dict[str, str] = {}
+
+
+class PreferenceOut(BaseModel):
+    key: str
+    value: str
+    updated_at: object
 
 
 # --- Auth dependency ---------------------------------------------------------
@@ -247,6 +255,25 @@ def reset_password(req: ResetPasswordRequest):
 
     set_password(user_id, req.new_password)
     return MessageResponse(message="Password updated. You can now log in with your new password.")
+
+
+# --- Preferences routes (protected) -----------------------------------------------
+
+
+def _preference_not_found_detail() -> dict:
+    return {"error_code": "preference_not_found", "message": "Preference not found"}
+
+
+@app.get("/preferences", response_model=list[PreferenceOut])
+def get_user_preferences(current_user: dict = Depends(get_current_user)):
+    return [PreferenceOut(**p) for p in list_preferences(current_user["id"])]
+
+
+@app.delete("/preferences/{key}", status_code=204, response_class=Response)
+def forget_user_preference(key: str, current_user: dict = Depends(get_current_user)):
+    if not delete_preference(current_user["id"], key):
+        raise HTTPException(status_code=404, detail=_preference_not_found_detail())
+    return Response(status_code=204)
 
 
 # --- Chat routes (protected) ----------------------------------------------------
@@ -352,6 +379,7 @@ def send_chat_message(
         conversation_id=resolved_conversation_id,
         reply=reply.reply_text,
         matched_restaurants=[_matched_restaurant_out(r) for r in reply.matched_restaurants],
+        new_preferences=reply.new_preferences,
     )
 
 
@@ -395,7 +423,8 @@ def send_chat_message_stream(
             {
                 "matched_restaurants": [
                     _matched_restaurant_out(r).model_dump() for r in reply.matched_restaurants
-                ]
+                ],
+                "new_preferences": reply.new_preferences,
             },
         )
 
