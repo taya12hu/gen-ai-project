@@ -46,6 +46,11 @@ class ChatReply:
     matched_restaurants: list[MatchedRestaurant]
     mentioned_restaurant_ids: list[int]
     mentioned_review_ids: list[int]
+    # Preference facts newly captured *this* turn (see
+    # app.chat.service.prepare_chat_turn) - surfaced separately from
+    # "Preferences applied to this search" so the frontend can tell the user
+    # what was just remembered, instead of that happening silently.
+    new_preferences: dict[str, str] = field(default_factory=dict)
 
 
 def _to_matched(candidate) -> MatchedRestaurant:
@@ -71,7 +76,9 @@ def _name_mentioned(name: str, llm_text: str) -> bool:
     return name.lower() in normalized_text
 
 
-def format_chat_reply(candidates: list, llm_text: str, force_match: bool = False) -> ChatReply:
+def format_chat_reply(
+    candidates: list, llm_text: str, force_match: bool = False, new_preferences: dict[str, str] | None = None
+) -> ChatReply:
     llm_text = llm_text.strip()
     # force_match: the followup-question path already resolved to exactly
     # one restaurant before the LLM call (see service.py) - the model isn't
@@ -86,4 +93,5 @@ def format_chat_reply(candidates: list, llm_text: str, force_match: bool = False
         matched_restaurants=matched_out,
         mentioned_restaurant_ids=[c.id for c in matched],
         mentioned_review_ids=[s.id for r in matched_out for s in r.review_snippets],
+        new_preferences=new_preferences or {},
     )
