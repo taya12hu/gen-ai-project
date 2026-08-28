@@ -13,14 +13,6 @@
   padding: 0 var(--space-2) var(--space-3);
 }
 
-.filter-chips-label {
-  font-size: 0.7rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text);
-  opacity: 0.65;
-}
-
 .filter-chip {
   display: inline-flex;
   align-items: center;
@@ -97,10 +89,6 @@
   }
 
   .filter-chips::-webkit-scrollbar {
-    display: none;
-  }
-
-  .filter-chips-label {
     display: none;
   }
 }

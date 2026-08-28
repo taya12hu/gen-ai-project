@@ -17,8 +17,10 @@ export default function FilterChips({ filters, onRemove, removing }) {
   if (!filters || filters.length === 0) return null
 
   return (
+    // The group's aria-label carries what the removed visible caption used to
+    // say - the chips are self-evident sighted, but a screen reader needs to
+    // know these are active constraints rather than suggestions.
     <div className="filter-chips" role="group" aria-label="Active search filters">
-      <span className="filter-chips-label">Searching for</span>
       {filters.map((f) => (
         <span key={f.dimension} className="filter-chip">
           <span className="filter-chip-text">{f.label}</span>
