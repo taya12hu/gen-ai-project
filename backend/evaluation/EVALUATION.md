@@ -99,6 +99,17 @@ Reporting both together is the point: metric 1 says "did it find *my*
 approved answers", metric 2 says "are the results it actually returned any
 good", and a result can score well on one and poorly on the other.
 
+**Current numbers (rank fusion, 2026-08-26).** After retrieval moved to
+summed top-3 review evidence fused with the structured ranking (see
+`app/retrieval/fusion.py`), Recall@5 went from 0.000 to 0.044 and Precision@5
+from 0.000 to 0.133, with 2 of 6 queries now returning at least one approved
+ground-truth id - the retriever had previously never matched a single one.
+Judged Relevance@5 moved the other way, 0.767 to 0.700, reproducibly across
+two runs. Both directions are consistent with what RRF does: it promotes
+higher-rated restaurants that match slightly less strongly on review text.
+Read that as a deliberate trade rather than a regression - and note that 30
+judgements is a small sample either way.
+
 **Known finding (from before the ground truth was widened).** With the
 original, stricter 3-4-ID ground truth, Recall@5 was 0.0 across all 6
 queries - not "low", zero. Spot-checking the actual retrieved reviews showed
