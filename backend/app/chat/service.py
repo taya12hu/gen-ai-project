@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 from app.chat.prompt_builder import build_chat_prompt
 from app.chat.response_formatter import ChatReply, format_chat_reply
-from app.conversation.preferences import get_preferences, upsert_preferences
+from app.conversation.preferences import PREFERENCE_KEYS, get_preferences, upsert_preferences
 from app.conversation.store import (
     ConversationNotFoundError,
     add_message,
@@ -53,6 +53,12 @@ SEARCH_LIMIT = 5
 # stored fact should bias what gets surfaced, but a one-off request in the
 # current message can still override it.
 #
+# This is the same closed vocabulary the storage layer enforces (see
+# app.conversation.preferences.PREFERENCE_KEYS) rather than a second list
+# maintained alongside it - when the two drifted apart, a fact stored under a
+# key this module didn't recognize was saved, shown to the user, and then
+# never applied to anything.
+#
 # Being *eligible* doesn't mean a given preference is applied to every turn,
 # though - query understanding (see relevant_preference_keys below) decides
 # per-message whether a specific stored fact is actually relevant to what
@@ -60,7 +66,7 @@ SEARCH_LIMIT = 5
 # every search used to silently skew unrelated requests (e.g. a stored
 # "healthier" preference narrowing an unrelated "late-night meal" search)
 # with no way for the user to know why.
-VIBE_PREFERENCE_KEYS = {"dietary", "ambience", "occasion", "vibe"}
+VIBE_PREFERENCE_KEYS = frozenset(PREFERENCE_KEYS)
 
 
 def _effective_vibe_query(vibe_query: str | None, preferences: dict[str, str]) -> str | None:
@@ -93,28 +99,38 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
 
     logger.info("Preparing chat turn for user_id=%s conversation_id=%s", user_id, conversation_id)
     recent_messages = get_messages(conversation_id, limit=HISTORY_LIMIT)
-    preferences = get_preferences(user_id)
-    vibe_preferences = {k: v for k, v in preferences.items() if k in VIBE_PREFERENCE_KEYS}
+    stored_preferences = {k: v for k, v in get_preferences(user_id).items() if k in VIBE_PREFERENCE_KEYS}
 
     known_places = get_known_places()
     known_cuisines = get_known_cuisines()
-    understanding = understand_query(message, recent_messages, known_places, known_cuisines, vibe_preferences)
+    understanding = understand_query(message, recent_messages, known_places, known_cuisines, stored_preferences)
 
-    if understanding.new_preferences:
-        upsert_preferences(user_id, understanding.new_preferences)
-        preferences = {**preferences, **understanding.new_preferences}
+    # upsert returns what was actually persisted after key normalization,
+    # which can differ from what the model proposed - that's what the user
+    # should be told was remembered, not the model's raw suggestion.
+    new_preferences = upsert_preferences(user_id, understanding.new_preferences)
 
-    # Only the subset query understanding judged relevant to *this* message,
-    # not everything ever stored - this is what actually gets applied to
-    # retrieval and shown to the user as "used for this search" (see
-    # build_chat_prompt). A preference that exists but wasn't judged
-    # relevant this turn is simply not in play for this turn; it can still
-    # surface on a later turn where it genuinely applies.
-    applied_preferences = {k: v for k, v in vibe_preferences.items() if k in understanding.relevant_preference_keys}
+    # Two sources, combined:
+    #
+    # - Stored facts, but only the subset query understanding judged relevant
+    #   to *this* message. A preference that exists but wasn't judged relevant
+    #   this turn is simply not in play; it can still surface on a later turn
+    #   where it genuinely applies.
+    # - Facts stated in this very message, applied unconditionally. They don't
+    #   go through the relevance gate: that gate exists to stop an unrelated
+    #   fact from an older conversation leaking in, and something the user
+    #   just said out loud in the message being answered is by definition not
+    #   that. (This previously merged into a variable nothing read again, so
+    #   "I'm vegetarian - where should I eat?" remembered the preference and
+    #   then ignored it for the very request that stated it.)
+    applied_preferences = {
+        **{k: v for k, v in stored_preferences.items() if k in understanding.relevant_preference_keys},
+        **new_preferences,
+    }
 
     candidates: list = []
     referenced_restaurant = None
-    relaxed = False
+    relaxation_note: str | None = None
 
     if understanding.intent == "followup_question" and understanding.refers_to_previous_restaurant:
         prior_ids = get_last_mentioned_restaurant_ids(conversation_id)
@@ -138,10 +154,16 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
             filters, _effective_vibe_query(understanding.vibe_query, applied_preferences), limit=SEARCH_LIMIT
         )
         candidates = result.candidates
-        relaxed = result.relaxed
+        relaxation_note = result.relaxation_note()
 
     prompt = build_chat_prompt(
-        message, understanding, candidates, relaxed, recent_messages, applied_preferences, referenced_restaurant
+        message,
+        understanding,
+        candidates,
+        relaxation_note,
+        recent_messages,
+        applied_preferences,
+        referenced_restaurant,
     )
 
     return PreparedChatTurn(
@@ -150,7 +172,7 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         prompt=prompt,
         candidates=candidates,
         referenced_restaurant=referenced_restaurant,
-        new_preferences=understanding.new_preferences,
+        new_preferences=new_preferences,
     )
 
 

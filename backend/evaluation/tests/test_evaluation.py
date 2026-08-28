@@ -60,7 +60,9 @@ def run_scenario(place, cuisines, max_price, min_rating):
     user_message = f"Suggest a {', '.join(cuisines)} restaurant in {place}"
 
     if result.candidates:
-        prompt = build_chat_prompt(user_message, understanding, result.candidates, result.relaxed, [], {})
+        prompt = build_chat_prompt(
+            user_message, understanding, result.candidates, result.relaxation_note(), [], {}
+        )
         llm_text = get_recommendation(prompt)
     else:
         llm_text = "No matching restaurants were found for your preferences."
