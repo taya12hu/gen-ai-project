@@ -9,9 +9,11 @@ full wired-together pipeline through the actual HTTP interface.
 import os
 import uuid
 
+import psycopg2
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api import main
 from app.api.main import app
 from app.auth import password_reset
 from app.storage.db import get_connection
@@ -41,10 +43,25 @@ def auth_headers():
 # --- Health --------------------------------------------------------------------
 
 
-def test_health_check():
+def test_health_check_reports_database_reachability():
+    """The platform uses this as its healthCheckPath, so it has to be able to
+    fail. It previously returned {"status": "ok"} unconditionally, which meant
+    an instance with an unreachable database kept being sent traffic it could
+    only fail."""
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "database": "ok"}
+
+
+def test_health_check_reports_503_when_the_database_is_unreachable(monkeypatch):
+    def boom():
+        raise psycopg2.OperationalError("connection refused")
+
+    monkeypatch.setattr(main, "get_connection", boom)
+
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded"
 
 
 # --- Auth: register / login / me ----------------------------------------------

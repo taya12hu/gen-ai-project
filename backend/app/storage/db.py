@@ -36,7 +36,22 @@ from psycopg2.pool import PoolError, ThreadedConnectionPool
 logger = logging.getLogger(__name__)
 
 MIN_POOL_SIZE = 1
-MAX_POOL_SIZE = 10
+
+# Must be read together with the server's request concurrency, not chosen in
+# isolation. FastAPI runs sync route handlers (which all of these are) on
+# AnyIO's worker thread pool, which defaults to 40 threads - so up to 40
+# requests can be inside get_connection() at once. With a pool of 10, the
+# 11th concurrent request didn't queue, it raised PoolError and failed the
+# request outright.
+#
+# The two numbers are now set from one place: DB_MAX_CONNECTIONS caps the
+# pool, and app.api.main sizes the request threadpool to match it so the
+# server never admits more concurrent DB-touching work than it has
+# connections for. The default stays conservative because managed Postgres
+# tiers (Supabase's pooler in particular) cap total connections per project,
+# and a handful of app instances each holding a large pool exhausts that
+# ceiling long before the app itself is saturated.
+MAX_POOL_SIZE = int(os.environ.get("DB_MAX_CONNECTIONS", "16"))
 CONNECT_TIMEOUT_SECONDS = 10
 
 

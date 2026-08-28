@@ -261,6 +261,14 @@ export default function ChatPage() {
           setMessages((prev) =>
             prev.map((m) => (m.id === replyId ? { ...m, matched_restaurants: data.matched_restaurants } : m))
           )
+          // The reply generated fine but the server couldn't save the turn.
+          // Say so rather than letting the user discover it by reloading and
+          // finding the exchange gone - the text on screen is still valid, so
+          // this is a warning about history, not about the answer.
+          if (data.persisted === false) {
+            setError("This reply couldn't be saved to your chat history. It'll be gone if you reload.")
+            return
+          }
           const noticeText = describeNewPreferences(data.new_preferences)
           if (noticeText) setNotice(noticeText)
         },
