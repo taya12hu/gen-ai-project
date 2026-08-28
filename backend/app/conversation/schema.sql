@@ -19,6 +19,17 @@ create table if not exists conversations (
 -- the table's already there.
 alter table conversations add column if not exists title text;
 
+-- The structured constraints currently in play for this conversation
+-- (place/cuisines/price/rating) - see app/conversation/filters.py. Held
+-- explicitly so they can be shown to the user and removed individually,
+-- rather than being re-inferred from the transcript each turn, which made
+-- them invisible and left whether one carried over to a model judgement.
+--
+-- jsonb rather than four columns because this is one cohesive value that is
+-- always read and written whole, and because the set of dimensions is likely
+-- to grow (open-now, outdoor seating) without wanting a migration each time.
+alter table conversations add column if not exists filters jsonb;
+
 create index if not exists conversations_user_id_idx on conversations (user_id);
 
 create table if not exists messages (

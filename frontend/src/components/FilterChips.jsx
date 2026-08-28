@@ -1,0 +1,39 @@
+import { X } from 'lucide-react'
+import './FilterChips.css'
+
+// The structured constraints currently shaping the search, shown above the
+// input so they're visible rather than implicit.
+//
+// These persist across turns: say "under Rs 800" once and it keeps applying
+// until removed. That's what makes "what about somewhere cheaper?" work
+// without repeating yourself, and it's also why the chips have to exist - an
+// invisible constraint that silently narrows every later search is the kind
+// of thing a user can only discover by being confused.
+//
+// Labels come from the backend (SearchState.as_chips) rather than being
+// formatted here, so a chip and the assistant's reply describe the same
+// constraint in the same words.
+export default function FilterChips({ filters, onRemove, removing }) {
+  if (!filters || filters.length === 0) return null
+
+  return (
+    <div className="filter-chips" role="group" aria-label="Active search filters">
+      <span className="filter-chips-label">Searching for</span>
+      {filters.map((f) => (
+        <span key={f.dimension} className="filter-chip">
+          {f.label}
+          <button
+            type="button"
+            className="filter-chip-remove"
+            onClick={() => onRemove(f.dimension)}
+            disabled={removing === f.dimension}
+            aria-label={`Remove filter: ${f.label}`}
+            title={`Remove ${f.label}`}
+          >
+            <X size={13} />
+          </button>
+        </span>
+      ))}
+    </div>
+  )
+}

@@ -255,3 +255,16 @@ export async function sendChatMessageStream(
     await sleep(retryDelay(attempt), signal)
   }
 }
+
+export function fetchConversationFilters(conversationId, token) {
+  return request(`/chat/conversations/${conversationId}/filters`, { token })
+}
+
+// Returns the filters that remain, so the caller updates from an
+// authoritative list rather than guessing what removal left behind.
+export function clearConversationFilter(conversationId, dimension, token) {
+  return request(`/chat/conversations/${conversationId}/filters/${encodeURIComponent(dimension)}`, {
+    method: 'DELETE',
+    token,
+  })
+}

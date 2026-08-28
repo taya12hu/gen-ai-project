@@ -37,6 +37,7 @@ from app.chat.service import (
     prepare_chat_turn,
     stream_chat_message_tokens,
 )
+from app.conversation.filters import FILTER_DIMENSIONS, clear_dimension, get_state
 from app.conversation.preferences import delete_preference, list_preferences
 from app.conversation.store import (
     ConversationNotFoundError,
@@ -184,6 +185,15 @@ class MessageOut(BaseModel):
     created_at: object
 
 
+class FilterChipOut(BaseModel):
+    """One active constraint, ready to render. The label is written by the
+    backend (see SearchState.as_chips) so the chip and the assistant's reply
+    describe the same constraint the same way."""
+
+    dimension: str
+    label: str
+
+
 class ChatMessageRequest(BaseModel):
     message: str = Field(min_length=1)
 
@@ -193,6 +203,7 @@ class ChatMessageResponse(BaseModel):
     reply: str
     matched_restaurants: list[MatchedRestaurantOut]
     new_preferences: dict[str, str] = {}
+    active_filters: list[FilterChipOut] = []
 
 
 class PreferenceOut(BaseModel):
@@ -345,6 +356,41 @@ def forget_user_preference(key: str, current_user: dict = Depends(get_current_us
 # --- Chat routes (protected) ----------------------------------------------------
 
 
+def _filter_not_found_detail(dimension: str) -> dict:
+    return {
+        "error_code": "unknown_filter",
+        "message": f"Unknown filter {dimension!r}; expected one of {', '.join(FILTER_DIMENSIONS)}",
+    }
+
+
+@app.get("/chat/conversations/{conversation_id}/filters", response_model=list[FilterChipOut])
+def get_chat_filters(conversation_id: int, current_user: dict = Depends(get_current_user)):
+    try:
+        get_conversation(conversation_id, current_user["id"])
+    except ConversationNotFoundError:
+        raise HTTPException(status_code=404, detail=_conversation_not_found_detail())
+    return [FilterChipOut(**c) for c in get_state(conversation_id).as_chips()]
+
+
+@app.delete("/chat/conversations/{conversation_id}/filters/{dimension}", response_model=list[FilterChipOut])
+def clear_chat_filter(
+    conversation_id: int, dimension: str, current_user: dict = Depends(get_current_user)
+):
+    """Drops one constraint and returns what remains.
+
+    Returns the surviving chips rather than 204, so the UI updates from an
+    authoritative list instead of guessing what removal left behind.
+    """
+    try:
+        get_conversation(conversation_id, current_user["id"])
+    except ConversationNotFoundError:
+        raise HTTPException(status_code=404, detail=_conversation_not_found_detail())
+    if dimension not in FILTER_DIMENSIONS:
+        raise HTTPException(status_code=404, detail=_filter_not_found_detail(dimension))
+
+    return [FilterChipOut(**c) for c in clear_dimension(conversation_id, dimension).as_chips()]
+
+
 @app.post("/chat/conversations", response_model=ConversationOut, status_code=201)
 def create_chat_conversation(current_user: dict = Depends(get_current_user)):
     conversation = create_conversation(current_user["id"])
@@ -475,6 +521,7 @@ def send_chat_message(
         reply=reply.reply_text,
         matched_restaurants=[_matched_restaurant_out(r) for r in reply.matched_restaurants],
         new_preferences=reply.new_preferences,
+        active_filters=[FilterChipOut(**c) for c in get_state(resolved_conversation_id).as_chips()],
     )
 
 
@@ -533,6 +580,7 @@ def send_chat_message_stream(
                     _matched_restaurant_out(r).model_dump() for r in reply.matched_restaurants
                 ],
                 "new_preferences": reply.new_preferences,
+                "active_filters": prepared.search_state.as_chips(),
             }
         except Exception:
             logger.exception(

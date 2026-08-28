@@ -25,10 +25,11 @@ handle_chat_message composes all three for the plain non-streaming path.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.chat.prompt_builder import build_chat_prompt
 from app.chat.response_formatter import ChatReply, format_chat_reply
+from app.conversation.filters import SearchState, get_state, merge, save_state
 from app.conversation.preferences import PREFERENCE_KEYS, get_preferences, upsert_preferences
 from app.conversation.store import (
     ConversationNotFoundError,
@@ -88,6 +89,8 @@ class PreparedChatTurn:
     candidates: list
     referenced_restaurant: object | None
     new_preferences: dict[str, str]
+    # The constraints in force after this turn, for the UI's chips.
+    search_state: SearchState = field(default_factory=SearchState)
 
 
 def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -> PreparedChatTurn:
@@ -108,7 +111,16 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
 
     known_places = get_known_places()
     known_cuisines = get_known_cuisines()
-    understanding = understand_query(message, recent_messages, known_places, known_cuisines, stored_preferences)
+    # The model is shown the constraints already in force, not left to
+    # reconstruct them from the transcript. Without them a comparative like
+    # "something cheaper" has no anchor to be cheaper *than*, and the model
+    # reached for clearing the budget instead of tightening it.
+    current_state = get_state(conversation_id)
+    active_filters = "; ".join(c["label"] for c in current_state.as_chips()) or "(none)"
+    understanding = understand_query(
+        message, recent_messages, known_places, known_cuisines, stored_preferences,
+        active_filters=active_filters,
+    )
 
     # upsert returns what was actually persisted after key normalization,
     # which can differ from what the model proposed - that's what the user
@@ -133,6 +145,16 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         **new_preferences,
     }
 
+    # Constraints carry over explicitly rather than by the model re-reading
+    # them out of the transcript each turn. Chitchat and bare preference
+    # statements leave them untouched: "I'm vegetarian" should not wipe the
+    # area you were searching in.
+    search_state = current_state
+    if understanding.intent in ("search", "followup_question"):
+        search_state = merge(search_state, understanding, understanding.cleared_filters)
+        save_state(conversation_id, search_state)
+        logger.info("Search state for conversation_id=%s: %s", conversation_id, search_state.to_json())
+
     candidates: list = []
     referenced_restaurant = None
     relaxation_note: str | None = None
@@ -154,11 +176,14 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
     if understanding.intent == "search" or (
         understanding.intent == "followup_question" and referenced_restaurant is None
     ):
+        # From the merged state, not from this message alone - that is what
+        # makes "what about somewhere cheaper?" keep the area you were
+        # searching in.
         filters = HybridFilters(
-            place=understanding.place,
-            cuisines=understanding.cuisines,
-            max_price=understanding.max_price,
-            min_rating=understanding.min_rating,
+            place=search_state.place,
+            cuisines=list(search_state.cuisines),
+            max_price=search_state.max_price,
+            min_rating=search_state.min_rating,
         )
         result = get_hybrid_candidates(
             filters, _effective_vibe_query(understanding.vibe_query, applied_preferences), limit=SEARCH_LIMIT
@@ -176,6 +201,7 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         applied_preferences,
         referenced_restaurant,
         weak_evidence=weak_evidence,
+        search_state=search_state,
     )
 
     return PreparedChatTurn(
@@ -185,6 +211,7 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         candidates=candidates,
         referenced_restaurant=referenced_restaurant,
         new_preferences=new_preferences,
+        search_state=search_state,
     )
 
 

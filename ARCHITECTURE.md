@@ -59,7 +59,7 @@ backend/
     auth/                  tokens.py (JWT/bcrypt), users.py, password_reset.py, email.py, schema.py
     llm/                   groq_client.py (primary), gemini_client.py (fallback), untrusted.py
     reviews/                schema.py, ingest.py, embed.py, embedding_model.py
-    conversation/           store.py (conversations/messages), preferences.py (durable facts), schema.py
+    conversation/           store.py (conversations/messages), preferences.py (durable facts), filters.py (per-conversation search state), schema.py
     retrieval/               known_values.py, hybrid.py, fusion.py, relaxation.py, cache.py
     query_understanding/     understanding.py
     chat/                     prompt_builder.py, response_formatter.py, service.py
@@ -82,7 +82,7 @@ Each domain package carries its own colocated `tests/`. Database schemas
 | Auth | `app/auth` | Registration/login, bcrypt password hashing, JWT issue/verify, password reset tokens, transactional email (Resend) |
 | LLM | `app/llm` | Groq client (primary) with automatic Gemini fallback on error; shared by query understanding and chat generation. Also owns fencing/length-capping of untrusted text bound for a prompt |
 | Review Ingestion | `app/reviews` | Re-derives individual reviews from the raw dataset, embeds them locally (`sentence-transformers`, 384-dim), stores in pgvector |
-| Conversation Store | `app/conversation` | `conversations`/`messages` (multi-turn memory) and `user_preferences` (durable, cross-session soft-default facts) |
+| Conversation Store | `app/conversation` | `conversations`/`messages` (multi-turn memory), `user_preferences` (durable, cross-session soft-default facts), and the per-conversation search state behind the filter chips |
 | Retrieval | `app/retrieval` | Known place/cuisine values (cached in-process, for snapping free text to canonical DB casing); hybrid structured-SQL + pgvector semantic retrieval, rank fusion of the two orderings, a bounded constraint-relaxation ladder, and an in-process TTL cache in front of it |
 | Query Understanding | `app/query_understanding` | One LLM JSON-mode call per message: intent, hard filters, vibe query, reference resolution, durable preference extraction |
 | Chat | `app/chat` | Multi-turn prompt construction, review-grounded response formatting, and the service layer orchestrating one full chat turn |
@@ -157,14 +157,31 @@ Each domain package carries its own colocated `tests/`. Database schemas
   `diet` instead of `dietary` produced a fact that was stored, shown to the
   user in the preferences panel, and then silently never applied to any
   search. Values can't be enumerated up front and are left alone.
-- **Filter carry-over between turns is implicit, and that's a trade-off.**
-  Nothing persists "under Rs 800" - `HybridFilters` is rebuilt from scratch
-  each turn, and a budget survives only because query understanding re-reads
-  it out of the last 10 messages. That's why follow-ups like "something
-  cheaper?" work with no special-casing, and equally why a constraint can
-  silently persist (or silently stop applying) with nothing in the UI showing
-  which are in force. An explicit per-conversation filter state with visible,
-  removable chips is the deliberate next step, not an oversight.
+- **Filter carry-over is explicit state, and the user can see it.**
+  (`app/conversation/filters.py`) The structured constraints in play are held
+  per conversation and merged each turn under three rules: a value the model
+  extracted SETS a dimension, a dimension it reports the user dropped CLEARS
+  it, and silence LEAVES IT ALONE. That last rule is what makes a constraint
+  persist; the middle one has to be asked for explicitly, because "somewhere
+  in Indiranagar" and "actually anywhere" look identical to a schema that only
+  reports what was mentioned.
+
+  This replaced implicit carry-over, where nothing was stored and a budget
+  survived only because query understanding re-read it out of the last 10
+  messages. That felt natural but made constraints invisible and
+  unpredictable: whether one carried over was a model judgement, and a search
+  returning nothing gave no hint that a ceiling from four turns ago was why.
+
+  The state is also shown *to* the understanding call, not just derived from
+  it. Without that, "what about something cheaper?" has no anchor to be
+  cheaper than, and the model cleared the budget rather than tightening it -
+  the exact failure this feature exists to prevent, found by testing a real
+  multi-turn conversation. It now reads Rs 800 and sets Rs 500.
+
+  The frontend renders each constraint as a removable chip above the input,
+  with labels written by the backend so a chip and the assistant's reply
+  describe the same constraint in the same words. Unlike `user_preferences`,
+  this state dies with the conversation - a new thread starts unconstrained.
 - **Groq primary, Gemini fallback.** If Groq errors (rate limit, outage,
   bad key), both the chat-generation call and the query-understanding call
   automatically retry against Gemini rather than failing the request

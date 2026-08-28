@@ -4,7 +4,9 @@ import { LogOut, Menu, Settings, X } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import {
   ApiError,
+  clearConversationFilter,
   createConversation,
+  fetchConversationFilters,
   fetchConversationMessages,
   listConversations,
   sendChatMessageStream,
@@ -17,6 +19,7 @@ import EmptyState from '../components/EmptyState'
 import ChatMessageBubble from '../components/ChatMessageBubble'
 import BrandLogo from '../components/BrandLogo'
 import PreferencesPanel from '../components/PreferencesPanel'
+import FilterChips from '../components/FilterChips'
 import { labelFor } from '../lib/preferenceLabels'
 import './ChatPage.css'
 
@@ -108,6 +111,10 @@ export default function ChatPage() {
   const [notice, setNotice] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [prefsOpen, setPrefsOpen] = useState(false)
+  // Structured constraints in force for this conversation. They persist
+  // across turns, so they're shown above the input rather than left implicit.
+  const [filters, setFilters] = useState([])
+  const [removingFilter, setRemovingFilter] = useState(null)
 
   const scrollRef = useRef(null)
   // Tracks the in-flight stream's AbortController so a conversation switch
@@ -155,8 +162,12 @@ export default function ChatPage() {
         setConversations(convos)
         if (convos.length > 0) {
           setConversationId(convos[0].id)
-          const msgs = await fetchConversationMessages(convos[0].id, token)
+          const [msgs, chips] = await Promise.all([
+            fetchConversationMessages(convos[0].id, token),
+            fetchConversationFilters(convos[0].id, token),
+          ])
           setMessages(msgs)
+          setFilters(chips)
         }
       })
       .catch((err) => {
@@ -177,8 +188,12 @@ export default function ChatPage() {
     setError(null)
     setConversationId(id)
     try {
-      const msgs = await fetchConversationMessages(id, token)
+      const [msgs, chips] = await Promise.all([
+        fetchConversationMessages(id, token),
+        fetchConversationFilters(id, token),
+      ])
       setMessages(msgs)
+      setFilters(chips)
     } catch (err) {
       if (handleAuthError(err)) return
       if (err instanceof ApiError && err.errorCode === 'conversation_not_found') {
@@ -193,7 +208,23 @@ export default function ChatPage() {
     streamAbortRef.current?.abort()
     setConversationId(null)
     setMessages([])
+    // A new thread starts unconstrained - that's the difference between these
+    // and remembered preferences, which outlive the conversation.
+    setFilters([])
     setError(null)
+  }
+
+  async function handleRemoveFilter(dimension) {
+    if (!conversationId) return
+    setRemovingFilter(dimension)
+    try {
+      setFilters(await clearConversationFilter(conversationId, dimension, token))
+    } catch (err) {
+      if (handleAuthError(err)) return
+      setError(friendlyErrorMessage(err))
+    } finally {
+      setRemovingFilter(null)
+    }
   }
 
   async function handleSend(e) {
@@ -269,6 +300,7 @@ export default function ChatPage() {
             setError("This reply couldn't be saved to your chat history. It'll be gone if you reload.")
             return
           }
+          if (data.active_filters) setFilters(data.active_filters)
           const noticeText = describeNewPreferences(data.new_preferences)
           if (noticeText) setNotice(noticeText)
         },
@@ -463,6 +495,7 @@ export default function ChatPage() {
         </div>
 
         <form className="chat-input-form" onSubmit={handleSend}>
+          <FilterChips filters={filters} onRemove={handleRemoveFilter} removing={removingFilter} />
           <div className="chat-input-wrap">
             <input
               type="text"

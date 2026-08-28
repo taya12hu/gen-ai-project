@@ -1,0 +1,61 @@
+.filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px 8px;
+}
+
+.filter-chips-label {
+  font-size: 0.78rem;
+  color: var(--text-muted, #6b7280);
+  margin-right: 2px;
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px 3px 10px;
+  border: 1px solid var(--border, #d9dee3);
+  border-radius: 999px;
+  background: var(--surface, #fff);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text, #1f2937);
+  white-space: nowrap;
+  /* Long place or cuisine lists shouldn't push the send button off-screen. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.filter-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted, #6b7280);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.filter-chip-remove:hover:not(:disabled) {
+  background: var(--surface-alt, #eef1f4);
+  color: var(--text, #1f2937);
+}
+
+.filter-chip-remove:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.filter-chip-remove:focus-visible {
+  outline: 2px solid var(--accent, #2f6f62);
+  outline-offset: 1px;
+}
