@@ -56,6 +56,28 @@ SEMANTIC_REVIEW_MULTIPLIER = 40
 # fewer rows than asked for. See _vector_search_settings.
 MIN_HNSW_EF_SEARCH = 400
 
+# Below this cosine similarity, a review snippet is not evidence for the vibe
+# it was retrieved against - it is simply the closest thing a small pool had.
+#
+# This is an empirical constant, which is exactly the kind of thing that
+# usually drifts with the dataset, so what it controls matters: it does not
+# suppress or reorder anything. It only decides whether the prompt is *told*
+# the evidence is thin, so being wrong costs an unnecessary hedge sentence in
+# one direction or a missing one in the other - never a lost result.
+#
+# Measured over the evaluation scenarios (mean similarity of shown snippets):
+#     unfiltered "cosy and quiet"                          0.297
+#     Indiranagar + North Indian, "quiet ... conversation"  0.376
+#     Whitefield, "quiet place away from crowds"           0.412
+#     HSR relaxed, "great ambience for a date"             0.220  judged 0/3 relevant
+#     Kaggadasapura relaxed, "cosy and quiet"              0.115  judged 0/5 relevant
+#
+# Genuine matches bottom out around 0.26; the two sets the LLM judge scored
+# zero on top out around 0.24. 0.25 sits in that gap. Relaxed searches produce
+# most of the low end, because relaxing is what creates pools small enough
+# that every review qualifies as a "match" regardless of what it says.
+WEAK_EVIDENCE_SIMILARITY = 0.25
+
 # The restaurant/review data is a one-time Hugging Face dataset load (app.data/app.reviews)
 # with no live refresh pipeline, so a long TTL is safe - it isn't going to serve
 # stale results against data that's actively changing. Bounded by max_size (see
@@ -114,6 +136,31 @@ class HybridRetrievalResult:
 
     def relaxation_note(self) -> str | None:
         return self.relaxation.describe() if self.relaxation is not None else None
+
+    @property
+    def evidence_is_weak(self) -> bool:
+        return evidence_is_weak(self.candidates)
+
+
+def evidence_is_weak(candidates) -> bool:
+    """Whether the review snippets attached to these candidates are too far
+    from the vibe query to support a qualitative claim.
+
+    A structurally-gated candidate set - "only restaurants whose reviews
+    surfaced in the semantic search" - stops meaning anything once the pool is
+    small. Kaggadasapura + Chinese is about five restaurants and thirty
+    reviews, so every one clears a top-300 cut trivially and "has evidence"
+    degrades to "exists". Its snippets come back at similarity 0.10-0.15,
+    about biryani masala and noodle packaging, for a query asking about
+    somewhere cosy and quiet.
+
+    Judged against the best snippet rather than the average: if even the
+    strongest one is weak, nothing shown supports the request.
+    """
+    similarities = [s.similarity for c in candidates for s in c.review_snippets]
+    if not similarities:
+        return False  # nothing shown, so nothing to over-claim about
+    return max(similarities) < WEAK_EVIDENCE_SIMILARITY
 
 
 def _row_to_candidate(row) -> RestaurantCandidate:

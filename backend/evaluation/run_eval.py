@@ -159,6 +159,7 @@ def _hybrid_result_to_dict(r) -> dict:
         "retrieved_ids": [c.id for c in r.candidates],
         "relaxed": r.relaxed,
         "relaxation_note": r.relaxation_note,
+        "evidence_weak": r.evidence_weak,
         "contained": r.contained,
         "violations": r.violations,
         "evidence_rate": r.evidence_rate,
@@ -222,6 +223,7 @@ def build_scorecard(structured_results, semantic_results, hybrid_results, groq_m
     returned = [c for r in hybrid_results for c in r.candidates]
     hybrid_evidence_rate = _avg([1.0 if c.review_snippets else 0.0 for c in returned])
     hybrid_judged = _judged_relevance_rate(hybrid_results)
+    hybrid_weak = sum(1 for x in hybrid_results if x.evidence_weak)
     avg_hybrid_latency = _avg([r.latency_seconds for r in hybrid_results])
 
     return {
@@ -255,6 +257,7 @@ def build_scorecard(structured_results, semantic_results, hybrid_results, groq_m
             "restaurants_returned": len(returned),
             "evidence_rate": hybrid_evidence_rate,
             "avg_judged_relevance_at_5": hybrid_judged,
+            "scenarios_flagged_weak_evidence": hybrid_weak,
             "avg_latency_seconds_retrieval_only": avg_hybrid_latency,
             "details": [_hybrid_result_to_dict(r) for r in hybrid_results],
         },
@@ -295,6 +298,7 @@ def print_scorecard(scorecard: dict) -> None:
     evidence_label = f"  Evidence rate ({h['restaurants_returned']} returned)"
     print(f"{evidence_label:<37}: {_fmt(h['evidence_rate'])}")
     print(f"  Avg Judged Relevance@5 (LLM judge) : {_fmt(h['avg_judged_relevance_at_5'])}")
+    print(f"  Flagged as weak evidence           : {h['scenarios_flagged_weak_evidence']}/{h['total']}")
     print(f"  Avg latency (retrieval only)       : {_fmt(h['avg_latency_seconds_retrieval_only'])}s")
     print()
     print("=" * 64)

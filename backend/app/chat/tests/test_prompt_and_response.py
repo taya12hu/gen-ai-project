@@ -276,3 +276,51 @@ def test_system_prompt_tells_the_model_that_quoted_text_is_data():
     system = build_chat_prompt("hi", understanding, [], None, [], {})[0]["content"].lower()
 
     assert "instructions" in system
+
+
+# --- weak evidence ----------------------------------------------------------
+#
+# When a filter relaxes into a tiny pool, every review in it clears the
+# semantic cut regardless of what it says, so the snippets shown can be noise.
+# The model can't tell by reading them - a review about noodle packaging looks
+# like ordinary evidence next to a query about somewhere quiet - so the prompt
+# has to say so.
+
+
+def test_weak_evidence_note_is_added_when_flagged():
+    understanding = QueryUnderstanding(intent="search")
+    candidate = make_candidate(snippets=[FakeSnippet(text="Packing was standard", rating=3.0)])
+    messages = build_chat_prompt(
+        "somewhere cosy and quiet?", understanding, [candidate], None, [], {}, weak_evidence=True
+    )
+
+    final = messages[-1]["content"].lower()
+    assert "closest available" in final
+    assert "couldn't find places matching that aspect" in final
+
+
+def test_no_weak_evidence_note_by_default():
+    understanding = QueryUnderstanding(intent="search")
+    candidate = make_candidate(snippets=[FakeSnippet(text="Genuinely quiet and calm", rating=4.5)])
+    messages = build_chat_prompt("quiet place?", understanding, [candidate], None, [], {})
+
+    assert "closest available" not in messages[-1]["content"].lower()
+
+
+def test_weak_evidence_note_does_not_suppress_the_snippets():
+    """The excerpts stay in the prompt - the model still needs them to talk
+    about the restaurants factually. Only the framing changes."""
+    understanding = QueryUnderstanding(intent="search")
+    candidate = make_candidate(snippets=[FakeSnippet(text="Packing was standard", rating=3.0)])
+    messages = build_chat_prompt(
+        "cosy and quiet?", understanding, [candidate], None, [], {}, weak_evidence=True
+    )
+
+    assert "Packing was standard" in messages[-1]["content"]
+
+
+def test_system_prompt_instructs_the_model_to_trust_the_weak_evidence_note():
+    understanding = QueryUnderstanding(intent="search")
+    system = build_chat_prompt("hi", understanding, [], None, [], {})[0]["content"].lower()
+
+    assert "don't closely match" in system

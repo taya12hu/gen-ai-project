@@ -40,7 +40,12 @@ from app.conversation.store import (
 )
 from app.llm.groq_client import get_recommendation, stream_recommendation
 from app.query_understanding.understanding import understand_query
-from app.retrieval.hybrid import HybridFilters, get_hybrid_candidates, get_reviews_for_restaurant
+from app.retrieval.hybrid import (
+    HybridFilters,
+    evidence_is_weak,
+    get_hybrid_candidates,
+    get_reviews_for_restaurant,
+)
 from app.retrieval.known_values import get_known_cuisines, get_known_places
 
 logger = logging.getLogger(__name__)
@@ -131,13 +136,18 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
     candidates: list = []
     referenced_restaurant = None
     relaxation_note: str | None = None
+    weak_evidence = False
 
     if understanding.intent == "followup_question" and understanding.refers_to_previous_restaurant:
         prior_ids = get_last_mentioned_restaurant_ids(conversation_id)
         if prior_ids:
-            referenced_restaurant = get_reviews_for_restaurant(
-                prior_ids[0], _effective_vibe_query(understanding.vibe_query, applied_preferences)
-            )
+            followup_vibe = _effective_vibe_query(understanding.vibe_query, applied_preferences)
+            referenced_restaurant = get_reviews_for_restaurant(prior_ids[0], followup_vibe)
+            # Only meaningful when a vibe query actually drove the selection -
+            # without one the snippets are the restaurant's top-rated reviews,
+            # carrying a placeholder similarity rather than a real score.
+            if referenced_restaurant is not None and followup_vibe:
+                weak_evidence = evidence_is_weak([referenced_restaurant])
         else:
             understanding.intent = "search"  # nothing to refer back to - fall through to a fresh search
 
@@ -155,6 +165,7 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         )
         candidates = result.candidates
         relaxation_note = result.relaxation_note()
+        weak_evidence = result.evidence_is_weak
 
     prompt = build_chat_prompt(
         message,
@@ -164,6 +175,7 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         recent_messages,
         applied_preferences,
         referenced_restaurant,
+        weak_evidence=weak_evidence,
     )
 
     return PreparedChatTurn(

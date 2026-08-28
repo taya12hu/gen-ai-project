@@ -175,6 +175,27 @@ instead:
 - *Judged Relevance@5* — the same Gemini judge the semantic suite uses,
   scoring whether that evidence genuinely supports the vibe.
 
+**What it found immediately.** Judged Relevance@5 came back at 0.364 against
+the vibe-only path's 0.700 — and the split was stark: unrelaxed scenarios
+averaged 12/25, while both *relaxed* scenarios scored **0/8**. Reading the
+actual snippets confirmed the judge: for "cosy and quiet" in Kaggadasapura the
+retriever returned reviews about biryani masala and noodle packaging, at
+similarities of 0.10–0.15.
+
+The cause is that a structurally-gated candidate set — "only restaurants whose
+reviews surfaced in the semantic search" — stops meaning anything once the
+pool is small. Kaggadasapura + Chinese is about five restaurants and thirty
+reviews, so every one clears a top-300 cut trivially and "has evidence"
+degrades to "exists". Relaxation makes this worse, because relaxing is what
+produces tiny pools in the first place.
+
+The retriever now flags this itself (`app.retrieval.hybrid.evidence_is_weak`)
+and the prompt is told, so a reply says it couldn't find places matching the
+mood rather than narrating whatever it was handed. Note that this does *not*
+move Judged Relevance@5 — that metric scores retrieval, and the flag changes
+only what is claimed about it. `scenarios_flagged_weak_evidence` tracks the
+detection separately.
+
 Unlike `tests/test_semantic_retrieval.py`, these tests **do** assert. That
 isn't inconsistent: recall over a tiny ground truth is fuzzy and a low score
 can be a bad draw, whereas containment is binary and a violation is a bug.

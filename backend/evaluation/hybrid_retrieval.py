@@ -34,6 +34,13 @@ path is actually supposed to guarantee:
    presented as matching a qualitative request.
 3. *Judged relevance* - whether that evidence genuinely supports the vibe,
    scored by the same LLM judge the semantic suite uses.
+4. *Weak-evidence flagging* - whether the retriever noticed its own evidence
+   was too far off to support a qualitative claim. This suite is what found
+   that problem: relaxed scenarios scored 0/8 on judged relevance because a
+   relaxed filter produces a pool small enough that every review clears the
+   semantic cut regardless of what it says. Tracking the flag here means a
+   regression in that detection shows up as a number rather than as a reply
+   that quietly over-claims.
 
 Retrieval only, no Groq/Gemini call, so this stays fast and isolates retrieval
 from generation. The judging happens in `run_eval.py`, keeping this module's
@@ -147,6 +154,7 @@ class HybridQueryResult:
     candidates: list  # RestaurantCandidate objects - evidence for the judge, filled in by run_eval
     relaxation_note: str | None
     relaxed: bool
+    evidence_weak: bool
     violations: list[str] = field(default_factory=list)
     latency_seconds: float = 0.0
     judged_relevant: list[bool | None] | None = None
@@ -218,6 +226,7 @@ def run_scenario(scenario: HybridScenario, k: int = RETRIEVAL_K) -> HybridQueryR
         candidates=result.candidates,
         relaxation_note=result.relaxation_note(),
         relaxed=result.relaxed,
+        evidence_weak=result.evidence_is_weak,
         violations=_check(scenario, result),
         latency_seconds=latency,
     )

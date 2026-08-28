@@ -93,3 +93,56 @@ def test_ordering_is_deterministic_across_calls():
     first = [f.restaurant_id for f in reciprocal_rank_fusion(rankings)]
     second = [f.restaurant_id for f in reciprocal_rank_fusion(rankings)]
     assert first == second
+
+
+# --- weak evidence detection ---------------------------------------------------
+#
+# Pure logic over similarity scores. The thresholds themselves are empirical
+# (see WEAK_EVIDENCE_SIMILARITY); these pin the decision rule, not the value.
+
+
+def _fake_candidate(similarities):
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class S:
+        similarity: float
+
+    @dataclass
+    class C:
+        review_snippets: list = field(default_factory=list)
+
+    return C(review_snippets=[S(s) for s in similarities])
+
+
+def test_evidence_is_weak_when_even_the_best_snippet_is_far_off():
+    """The Kaggadasapura case: a pool so small that every review clears the
+    semantic cut, so the snippets are about noodle packaging."""
+    from app.retrieval.hybrid import evidence_is_weak
+
+    assert evidence_is_weak([_fake_candidate([0.15, 0.13, 0.10])]) is True
+
+
+def test_evidence_is_not_weak_when_one_strong_snippet_exists():
+    """Judged on the best snippet, not the average - one genuine match is
+    enough to support a qualitative claim, and the reply only needs one."""
+    from app.retrieval.hybrid import evidence_is_weak
+
+    assert evidence_is_weak([_fake_candidate([0.45, 0.12, 0.10])]) is False
+
+
+def test_evidence_is_judged_across_all_candidates_not_per_restaurant():
+    from app.retrieval.hybrid import evidence_is_weak
+
+    weak = _fake_candidate([0.11])
+    strong = _fake_candidate([0.48])
+    assert evidence_is_weak([weak, strong]) is False
+
+
+def test_no_snippets_is_not_weak_evidence():
+    """Nothing was shown, so there is nothing to over-claim about - a
+    structured-only search must not trigger the hedge."""
+    from app.retrieval.hybrid import evidence_is_weak
+
+    assert evidence_is_weak([_fake_candidate([])]) is False
+    assert evidence_is_weak([]) is False
