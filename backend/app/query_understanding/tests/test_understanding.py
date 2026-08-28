@@ -139,3 +139,100 @@ def test_relevant_preference_keys_excludes_unrelated_stored_preference():
         preferences={"ambience": "quiet, romantic"},
     )
     assert "ambience" not in result.relevant_preference_keys
+
+
+# --- cleared_filters: widening a search -------------------------------------
+#
+# Constraints carry over between turns (see app.conversation.filters), so
+# `cleared_filters` is the only way a user can widen one. That makes the
+# distinction it draws load-bearing: silence means "leave it alone", a value
+# means "set it", and only an explicit dismissal means "drop it".
+#
+# The clamp tests are pure; the rest are real Groq calls, like the intent and
+# preference tests above, because what's being checked is the model's reading
+# of a phrase rather than our handling of its answer.
+
+ACTIVE = "Indiranagar; Chinese; under Rs 800"
+
+
+def test_clamp_cleared_filters_drops_invented_dimensions():
+    """An unrecognized name would silently clear nothing, leaving a constraint
+    the user believes they removed still applied to every later turn."""
+    understanding = qu.QueryUnderstanding(cleared_filters=["place", "budget", "location"])
+    assert qu._clamp_cleared_filters(understanding).cleared_filters == ["place"]
+
+
+def test_clamp_cleared_filters_keeps_valid_dimensions_untouched():
+    understanding = qu.QueryUnderstanding(cleared_filters=["place", "price", "rating", "cuisines"])
+    assert qu._clamp_cleared_filters(understanding).cleared_filters == [
+        "place", "price", "rating", "cuisines"
+    ]
+
+
+def test_dropping_a_place_clears_it():
+    result = qu.understand_query(
+        "actually anywhere, not just Indiranagar", [], KNOWN_PLACES, KNOWN_CUISINES,
+        active_filters=ACTIVE,
+    )
+    assert "place" in result.cleared_filters
+
+
+def test_dismissing_the_budget_clears_price():
+    result = qu.understand_query(
+        "any budget is fine now", [], KNOWN_PLACES, KNOWN_CUISINES, active_filters=ACTIVE
+    )
+    assert "price" in result.cleared_filters
+
+
+def test_a_comparative_adjusts_the_budget_instead_of_clearing_it():
+    """The regression this exists for. "Cheaper" originally came back as
+    cleared=['price'], which deleted the budget outright - the model read a
+    comparative as a removal, having no anchor to be cheaper *than* until the
+    active filters were shown to it."""
+    result = qu.understand_query(
+        "what about something cheaper?", [], KNOWN_PLACES, KNOWN_CUISINES, active_filters=ACTIVE
+    )
+
+    assert "price" not in result.cleared_filters
+    assert result.max_price is not None and result.max_price < 800
+
+
+def test_a_comparative_on_rating_does_not_clear_it():
+    result = qu.understand_query(
+        "anything better rated?", [], KNOWN_PLACES, KNOWN_CUISINES,
+        active_filters="Indiranagar; 3.5+ stars",
+    )
+    assert "rating" not in result.cleared_filters
+
+
+def test_not_mentioning_a_constraint_does_not_clear_it():
+    """Silence is what makes a constraint persist at all - a message about
+    cuisine must leave an active budget and area alone."""
+    result = qu.understand_query(
+        "show me some Chinese places", [], KNOWN_PLACES, KNOWN_CUISINES, active_filters=ACTIVE
+    )
+    assert result.cleared_filters == []
+
+
+def test_replacing_a_constraint_sets_it_rather_than_clearing_it():
+    """"Actually make it Koramangala" - there is no need to clear first, and
+    clearing would briefly widen the search to everywhere."""
+    result = qu.understand_query(
+        "actually make it Koramangala", [], KNOWN_PLACES, KNOWN_CUISINES, active_filters=ACTIVE
+    )
+
+    assert result.place == "Koramangala"
+    assert "place" not in result.cleared_filters
+
+
+def test_chitchat_clears_nothing():
+    result = qu.understand_query("hey, how's it going?", [], KNOWN_PLACES, KNOWN_CUISINES, active_filters=ACTIVE)
+    assert result.cleared_filters == []
+
+
+def test_several_constraints_can_be_dropped_at_once():
+    result = qu.understand_query(
+        "forget the budget and the area, just show me anything Chinese",
+        [], KNOWN_PLACES, KNOWN_CUISINES, active_filters=ACTIVE,
+    )
+    assert {"place", "price"} <= set(result.cleared_filters)
