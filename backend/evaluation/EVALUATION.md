@@ -17,7 +17,13 @@ pipeline as a whole, across three pieces:
    `tests/test_semantic_retrieval.py`) — checks retrieval quality in
    isolation, independent of generation, against a small manually-verified
    ground truth.
-3. **A scorecard** (`run_eval.py`) that runs both suites plus an LLM judge
+3. **Hybrid filters + vibe** (`hybrid_retrieval.py`,
+   `tests/test_hybrid_retrieval.py`) — 8 scenarios combining structured
+   constraints *with* a qualitative query, checking **containment** (nothing
+   returned violates the constraints the retriever says it applied),
+   **evidence** (every candidate carries review snippets), and judged
+   relevance.
+4. **A scorecard** (`run_eval.py`) that runs all three suites plus an LLM judge
    and prints/saves a single summary — see "Scorecard" below.
 
 ## Scenarios (structured retrieval + generation)
@@ -131,6 +137,48 @@ not a quality gate, regardless of how the ground truth changes. Read the
 actual Recall@5/Precision@5/Judged Relevance@5 numbers from `run_eval.py`'s
 scorecard.
 
+## Hybrid (filters + vibe) evaluation
+
+The other two suites each exercise half the retriever: the structured
+scenarios run with `vibe_query=None` so semantic search never executes, and
+the semantic queries run with an empty `HybridFilters()` so no structured
+predicate ever applies. Neither covers *"somewhere quiet in Whitefield under
+Rs 1000"* — the most common shape a real user types, and the only path where
+the two halves interact: where the filter restricts what semantic search may
+rank, where the relaxation ladder can fire, and where rank fusion has both
+signals to merge.
+
+That gap had teeth. Two changes confined to this interaction — removing the
+500-restaurant pool cap, and switching filtered searches from HNSW to exact
+scanning — were invisible to the scorecard, which reported identical numbers
+before and after by construction.
+
+**Scenarios.** 8, drawn from real data, covering the selectivity range the
+retriever behaves differently across: a narrow place+cuisine pool (134
+restaurants), a broad place-only pool (Whitefield, 584 — which exceeded the
+old cap), each numeric constraint alone, both together, two relaxation shapes,
+and an impossible cuisine.
+
+**Metrics — deliberately not recall.** The lesson from the semantic suite is
+that a small hand-picked ground truth grades a retriever unfairly over 9,000
+restaurants. This suite checks properties the path is supposed to *guarantee*
+instead:
+
+- *Containment* — every returned restaurant satisfies the hard constraints.
+  Place and cuisine strictly (never relaxed); price and rating against the
+  values the retriever reports it actually applied, so a legitimately relaxed
+  search is judged on what it promised rather than what was first asked.
+  Fully deterministic, no judge involved.
+- *Evidence* — every returned restaurant carries review snippets, since a
+  candidate with no supporting text cannot honestly answer a qualitative
+  request.
+- *Judged Relevance@5* — the same Gemini judge the semantic suite uses,
+  scoring whether that evidence genuinely supports the vibe.
+
+Unlike `tests/test_semantic_retrieval.py`, these tests **do** assert. That
+isn't inconsistent: recall over a tiny ground truth is fuzzy and a low score
+can be a bad draw, whereas containment is binary and a violation is a bug.
+
 ## LLM-as-judge
 
 `judge.py` has two judges, both Gemini (`app.llm.gemini_client`) -
@@ -155,9 +203,10 @@ runs, not a precise or fully reproducible measurement. See the comments in
 
 ## Scorecard (`run_eval.py`)
 
-Runs both suites - the 10 structured scenarios (with the helpfulness judge
-attached) and the 6 semantic retrieval scenarios (with the retrieval-
-relevance judge attached) - and prints one scorecard: grounding rate,
+Runs all three suites - the 10 structured scenarios (with the helpfulness
+judge attached), the 6 semantic retrieval scenarios and the 8 hybrid
+filters+vibe scenarios (both with the retrieval-relevance judge attached) -
+and prints one scorecard: grounding rate,
 relevance rate, avg LLM-judge helpfulness, avg latency (structured:
 retrieval+generation; semantic: retrieval only, reported separately so the
 two are never confused), semantic Recall@5/Precision@5/Judged Relevance@5,
