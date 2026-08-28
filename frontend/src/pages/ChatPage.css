@@ -265,10 +265,15 @@
   font-size: 14px;
 }
 
-.chat-input-form {
-  display: flex;
+/* Chips and input are one unit: the separator and top padding belong to the
+   composer so the chips sit inside it, not adrift in the message list. */
+.chat-composer {
   padding-top: var(--space-3);
   border-top: 1px solid var(--border);
+}
+
+.chat-input-form {
+  display: flex;
 }
 
 .chat-input-wrap {

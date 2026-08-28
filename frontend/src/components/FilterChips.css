@@ -1,61 +1,106 @@
+/* Active search constraints, sitting directly above the composer input.
+   Colours come from the app's tokens (warm dark, orange accent) - an earlier
+   version invented --text-muted and --surface-alt, which don't exist here, so
+   they fell back to light-theme greys that looked pasted on. */
+
 .filter-chips {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  padding: 0 4px 8px;
+  /* Indented to sit under the input's rounded left edge rather than hard
+     against the panel wall, so the chips read as belonging to the composer. */
+  padding: 0 var(--space-2) var(--space-3);
 }
 
 .filter-chips-label {
-  font-size: 0.78rem;
-  color: var(--text-muted, #6b7280);
-  margin-right: 2px;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text);
+  opacity: 0.65;
 }
 
 .filter-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 4px 3px 10px;
-  border: 1px solid var(--border, #d9dee3);
-  border-radius: 999px;
-  background: var(--surface, #fff);
-  font-size: 0.82rem;
-  line-height: 1.4;
-  color: var(--text, #1f2937);
-  white-space: nowrap;
-  /* Long place or cuisine lists shouldn't push the send button off-screen. */
+  gap: 2px;
+  /* Less padding on the right because the remove button carries its own. */
+  padding: 2px 4px 2px 10px;
+  /* Pill, matching the input and send button rather than introducing a
+     third corner radius into the composer. */
+  border-radius: var(--radius-pill);
+  /* Accent-tinted: these are constraints that are ON, and the same warm tint
+     already means "active" elsewhere in the app. Subtle enough that four of
+     them don't shout. */
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--text-h);
+  font-size: 0.76rem;
+  line-height: 1.45;
   max-width: 100%;
+  min-width: 0;
+}
+
+/* The label truncates, not the chip - a long cuisine list shouldn't be able to
+   push the remove button out of reach. */
+.filter-chip-text {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .filter-chip-remove {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
+  width: 17px;
+  height: 17px;
   padding: 0;
   border: none;
-  border-radius: 50%;
+  border-radius: var(--radius-pill);
   background: transparent;
-  color: var(--text-muted, #6b7280);
+  color: var(--text);
   cursor: pointer;
   flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .filter-chip-remove:hover:not(:disabled) {
-  background: var(--surface-alt, #eef1f4);
-  color: var(--text, #1f2937);
+  background: var(--accent);
+  color: var(--bg);
 }
 
 .filter-chip-remove:disabled {
-  opacity: 0.4;
+  opacity: 0.45;
   cursor: default;
 }
 
 .filter-chip-remove:focus-visible {
-  outline: 2px solid var(--accent, #2f6f62);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .filter-chip-remove {
+    transition: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .filter-chips {
+    /* Many chips on a narrow screen would otherwise eat the message area;
+       one scrolling row keeps the composer a predictable height. */
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .filter-chips::-webkit-scrollbar {
+    display: none;
+  }
+
+  .filter-chips-label {
+    display: none;
+  }
 }

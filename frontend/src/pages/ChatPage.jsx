@@ -494,39 +494,41 @@ export default function ChatPage() {
           )}
         </div>
 
-        <form className="chat-input-form" onSubmit={handleSend}>
+        <div className="chat-composer">
           <FilterChips filters={filters} onRemove={handleRemoveFilter} removing={removingFilter} />
-          <div className="chat-input-wrap">
-            <input
-              type="text"
-              className="chat-input"
-              placeholder="Ask about restaurants…"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              aria-label="Chat message"
-            />
-            <button
-              type="submit"
-              className="chat-send-btn"
-              disabled={!input.trim() || loading}
-              aria-label="Send message"
-            >
-              {loading ? (
-                <Spinner size={16} />
-              ) : (
-                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
-                  <path
-                    d="M12 19V5M12 5L6 11M12 5L18 11"
-                    stroke="currentColor"
-                    strokeWidth="2.4"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              )}
-            </button>
-          </div>
-        </form>
+          <form className="chat-input-form" onSubmit={handleSend}>
+            <div className="chat-input-wrap">
+              <input
+                type="text"
+                className="chat-input"
+                placeholder="Ask about restaurants…"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                aria-label="Chat message"
+              />
+              <button
+                type="submit"
+                className="chat-send-btn"
+                disabled={!input.trim() || loading}
+                aria-label="Send message"
+              >
+                {loading ? (
+                  <Spinner size={16} />
+                ) : (
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
+                    <path
+                      d="M12 19V5M12 5L6 11M12 5L18 11"
+                      stroke="currentColor"
+                      strokeWidth="2.4"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
     </div>
   )

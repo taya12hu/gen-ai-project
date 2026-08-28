@@ -21,7 +21,7 @@ export default function FilterChips({ filters, onRemove, removing }) {
       <span className="filter-chips-label">Searching for</span>
       {filters.map((f) => (
         <span key={f.dimension} className="filter-chip">
-          {f.label}
+          <span className="filter-chip-text">{f.label}</span>
           <button
             type="button"
             className="filter-chip-remove"
@@ -30,7 +30,7 @@ export default function FilterChips({ filters, onRemove, removing }) {
             aria-label={`Remove filter: ${f.label}`}
             title={`Remove ${f.label}`}
           >
-            <X size={13} />
+            <X size={11} />
           </button>
         </span>
       ))}
