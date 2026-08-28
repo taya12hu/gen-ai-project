@@ -30,6 +30,7 @@ import logging
 from dataclasses import dataclass, field
 
 from app.retrieval.cache import CACHE_MISS, TTLCache
+from app.retrieval import rerank
 from app.retrieval.fusion import SEMANTIC_TOP_K, reciprocal_rank_fusion, semantic_score
 from app.retrieval.relaxation import AppliedRelaxation, relaxation_ladder
 from app.reviews.embedding_model import get_embedder
@@ -97,6 +98,9 @@ class ReviewSnippet:
     text: str
     rating: float | None
     similarity: float
+    # Cross-encoder relevance logit, when reranking ran for this query.
+    # None means it didn't - which is different from 'it scored badly'.
+    rerank_score: float | None = None
 
 
 @dataclass
@@ -156,6 +160,20 @@ def evidence_is_weak(candidates) -> bool:
 
     Judged against the best snippet rather than the average: if even the
     strongest one is weak, nothing shown supports the request.
+
+    Deliberately still cosine, not the cross-encoder's score, even though the
+    cross-encoder is the better relevance judge and reranking now attaches one.
+    Its logits are calibrated for MS MARCO passage ranking, and on review text
+    the scale shifts: a snippet reading "loved the cosy corner seating, soft
+    music, never crowded" - a genuinely good answer to a query about somewhere
+    quiet - scores -8.65. Treating zero as the relevant/irrelevant boundary
+    would flag that as no evidence at all. The cosine threshold is fitted to
+    this dataset, which is a real weakness, but it was at least validated
+    against the LLM judge's verdicts; the cross-encoder boundary would be an
+    unvalidated guess wearing the costume of a principled constant.
+
+    The cross-encoder is trusted for *ordering*, where only the relative order
+    of its scores matters, and not for this absolute judgement.
     """
     similarities = [s.similarity for c in candidates for s in c.review_snippets]
     if not similarities:
@@ -509,6 +527,7 @@ def get_hybrid_candidates(filters: HybridFilters, vibe_query: str | None, limit:
 
 def _fuse_and_hydrate(
     conn,
+    vibe_query: str,
     snippets: dict[int, list[tuple[int, float | None, float]]],
     similarities: dict[int, list[float]],
     ranking_facts: dict[int, tuple[float, int]],
@@ -536,13 +555,17 @@ def _fuse_and_hydrate(
     )
 
     fused = reciprocal_rank_fusion([structured_ranking, semantic_ranking])
-    top_ids = [f.restaurant_id for f in fused if f.restaurant_id in ranking_facts][:limit]
+    ranked_ids = [f.restaurant_id for f in fused if f.restaurant_id in ranking_facts]
 
-    snippet_ids = [review_id for rid in top_ids for review_id, _, _ in snippets.get(rid, [])]
-    facts, texts = _fetch_candidates_with_texts(conn, top_ids, snippet_ids)
+    # Hydrate a shortlist rather than just the final `limit`, so the
+    # cross-encoder has something to choose between. Without reranking this
+    # collapses back to exactly the old behaviour.
+    shortlist = ranked_ids[: rerank.RERANK_POOL] if rerank.is_enabled() else ranked_ids[:limit]
+    snippet_ids = [review_id for rid in shortlist for review_id, _, _ in snippets.get(rid, [])]
+    facts, texts = _fetch_candidates_with_texts(conn, shortlist, snippet_ids)
 
-    candidates: list[RestaurantCandidate] = []
-    for rid in top_ids:
+    built: dict[int, RestaurantCandidate] = {}
+    for rid in shortlist:
         candidate = facts.get(rid)
         if candidate is None:
             continue
@@ -551,8 +574,57 @@ def _fuse_and_hydrate(
             for review_id, rating, similarity in snippets.get(rid, [])
             if review_id in texts
         ]
-        candidates.append(candidate)
-    return candidates
+        built[rid] = candidate
+
+    ordered_ids = _rerank_ids(vibe_query, shortlist, built)
+    return [built[rid] for rid in ordered_ids[:limit] if rid in built]
+
+
+def _rerank_ids(
+    vibe_query: str, shortlist: list[int], built: dict[int, RestaurantCandidate]
+) -> list[int]:
+    """Reorders the shortlist by cross-encoder relevance, or returns it
+    unchanged when reranking didn't run.
+
+    Scores every snippet of every shortlisted restaurant in one batched call,
+    then ranks each restaurant by its *best* snippet. Best rather than summed,
+    deliberately, and unlike the bi-encoder aggregation upstream: summing there
+    rewards a restaurant with several corroborating reviews, which is a
+    reasonable proxy when the signal per review is weak. Here the signal is
+    strong enough that one review genuinely answering the question is what
+    justifies recommending the place - and one is all the reply needs to
+    quote.
+    """
+    pairs: list[tuple[int, ReviewSnippet]] = [
+        (rid, snippet)
+        for rid in shortlist
+        if rid in built
+        for snippet in built[rid].review_snippets[: rerank.SNIPPETS_PER_CANDIDATE]
+    ]
+    if not pairs:
+        return shortlist
+
+    scores = rerank.score_pairs(vibe_query, [snippet.text for _, snippet in pairs])
+    if scores is None:
+        return shortlist  # unavailable or disabled - fusion order stands
+
+    best: dict[int, float] = {}
+    for (rid, snippet), score in zip(pairs, scores):
+        snippet.rerank_score = score
+        best[rid] = max(best.get(rid, float("-inf")), score)
+
+    # Snippets are shown in the order the reply will quote them, so the
+    # strongest evidence should lead.
+    for candidate in built.values():
+        candidate.review_snippets.sort(key=lambda s: s.rerank_score or float("-inf"), reverse=True)
+
+    reordered = sorted(shortlist, key=lambda rid: (-best.get(rid, float("-inf")), shortlist.index(rid)))
+    moved = sum(1 for i, rid in enumerate(reordered[:5]) if rid != shortlist[i])
+    logger.info(
+        "Reranked %d restaurant(s) from %d snippet(s); %d of the top 5 changed",
+        len(shortlist), len(pairs), moved,
+    )
+    return reordered
 
 
 def _get_hybrid_candidates_uncached(filters: HybridFilters, vibe_query: str, limit: int) -> HybridRetrievalResult:
@@ -600,7 +672,7 @@ def _get_hybrid_candidates_uncached(filters: HybridFilters, vibe_query: str, lim
             # Rank on (rating, votes) alone - the full restaurant rows are
             # only worth fetching for the few that survive fusion.
             ranking_facts = _fetch_ranking_facts(conn, list(similarities.keys()))
-            candidates = _fuse_and_hydrate(conn, snippets, similarities, ranking_facts, limit)
+            candidates = _fuse_and_hydrate(conn, vibe_query, snippets, similarities, ranking_facts, limit)
     finally:
         conn.close()
 

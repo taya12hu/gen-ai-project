@@ -110,6 +110,19 @@ Each domain package carries its own colocated `tests/`. Database schemas
   constants that drift with the dataset. Ranking previously used only each
   restaurant's single best review and discarded the structured signal
   entirely whenever a vibe query was present.
+- **A cross-encoder can rerank the shortlist, but ships off.**
+  (`app/retrieval/rerank.py`) Everything upstream is bi-encoder similarity:
+  query and review are embedded separately and compared, which is what makes
+  searching 58,786 reviews fast and is also its ceiling — the two texts never
+  meet, so a review reading "Ambience is quiet good" (a typo for "quite")
+  matches a query about somewhere quiet. A cross-encoder reads the pair
+  together and is the only stage that can fix a *wrong* match rather than
+  reorder the matches already found. Measured, it lifts judged relevance from
+  0.364 to 0.606 on the hybrid path and 0.700 to 0.867 on the vibe-only path,
+  for about +2.1s per query and ~90MB — so it is available behind
+  `RERANK_ENABLED` rather than on, given where this deploys. Its scores are
+  trusted for ordering only; they are not calibrated for an absolute
+  relevant/irrelevant judgement on this data.
 - **Soft constraints are widened a step at a time, and the reply says so.**
   (`app/retrieval/relaxation.py`) When strict filters match nothing, budget
   and rating are loosened along a bounded ladder - one dimension at a time,

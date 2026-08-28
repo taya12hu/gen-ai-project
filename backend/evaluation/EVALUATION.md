@@ -200,6 +200,41 @@ Unlike `tests/test_semantic_retrieval.py`, these tests **do** assert. That
 isn't inconsistent: recall over a tiny ground truth is fuzzy and a low score
 can be a bad draw, whereas containment is binary and a violation is a bug.
 
+## Cross-encoder reranking (off by default)
+
+`app/retrieval/rerank.py` adds a final stage that rescores the shortlist with a
+cross-encoder, which reads query and review *together* rather than comparing
+them as independent embeddings. It ships disabled (`RERANK_ENABLED=1` turns it
+on); both scorecards below come from the same suites, with reranking as the
+only variable.
+
+| Metric | off | on |
+|---|---|---|
+| Hybrid Judged Relevance@5 | 0.364 | **0.606** |
+| Semantic Judged Relevance@5 | 0.700 | **0.867** |
+| Semantic Recall@5 / Precision@5 | 0.044 / 0.133 | 0.033 / 0.100 |
+| Hybrid containment | 1.000 | 1.000 |
+| Hybrid latency (retrieval only) | 1.373s | 3.455s |
+| Semantic latency (retrieval only) | 2.211s | 4.794s |
+
+**On reading these.** The structured suite never reranks — every one of its
+scenarios passes `vibe_query=None`, so semantic search doesn't run — yet its
+judge score still moved 5.00 → 4.78 between the two runs. That drift on
+identical inputs is the judge's noise floor, roughly 0.2, and both relevance
+gains sit clearly outside it.
+
+Recall and precision moved *down* slightly while judged relevance moved up. The
+reranked results overlap less with the hand-picked ground truth while the
+judge — which never sees that id list — rates them better. That is the exact
+tension both metrics exist to expose (see "Known finding" below): 11–15
+approved ids across 9,216 restaurants is a weak signal, and `hit@5` held at
+2/6 either way.
+
+**Why it is off.** Roughly +2.1s per vibe query and ~90MB resident for a second
+model, measured on a 12-core development machine. This project deploys to a
+free-tier instance already tight enough to need a CPU-only torch pin, and
+slower than that. On capable hardware the trade is clearly worth taking.
+
 ## LLM-as-judge
 
 `judge.py` has two judges, both Gemini (`app.llm.gemini_client`) -
