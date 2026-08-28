@@ -42,16 +42,6 @@ RESTAURANT_COLUMNS = ["id", "name", "place", "city", "cuisines", "price", "ratin
 DEFAULT_LIMIT = 10
 SNIPPETS_PER_RESTAURANT = 3
 
-# How many structurally-matching restaurants the semantic search is allowed to
-# rank within. This used to be max(limit * 8, 50), which meant a vibe query in
-# a busy area only ever saw the 50 highest-rated matches - rating silently
-# became the dominant relevance signal before the vibe text was consulted at
-# all, and a genuinely quiet 3.8-star place was unreachable. The pool is now
-# wide enough to cover essentially any single place/cuisine combination in the
-# dataset (the largest is a few hundred rows), so the fusion step decides the
-# order rather than the pre-filter.
-STRUCTURED_POOL_SIZE = 500
-
 # Reviews to pull from pgvector before aggregating by restaurant. Each
 # restaurant holds up to 15 reviews (see app.reviews.ingest), so a small
 # review pool can collapse to only a handful of distinct restaurants; this has
@@ -74,36 +64,6 @@ MIN_HNSW_EF_SEARCH = 400
 # clear_cache() (or just restart the process) to avoid serving week-old results.
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # 1 week
 _cache = TTLCache(ttl_seconds=CACHE_TTL_SECONDS)
-
-# hnsw.iterative_scan arrived in pgvector 0.8.0. Detected from the installed
-# extension version, probed once per process.
-#
-# Not by looking the GUC up in pg_settings, which is the obvious approach and
-# is wrong: an extension's custom GUCs only appear there once its shared
-# library has been loaded into that backend, which happens lazily on the first
-# vector operation. The probe runs before that, so pg_settings reported the
-# setting as absent on a 0.8.2 install and silently disabled the very tuning
-# it was there to enable. Not by SET-and-catch either - a failed SET aborts
-# the surrounding transaction and would take the real query down with it.
-MIN_ITERATIVE_SCAN_VERSION = (0, 8)
-_supports_iterative_scan: bool | None = None
-
-
-def _parse_extension_version(raw: str) -> tuple[int, ...]:
-    """'0.8.2' -> (0, 8, 2). Non-numeric suffixes are ignored rather than
-    raising, since a version string is not worth failing a search over."""
-    parts: list[int] = []
-    for chunk in raw.split("."):
-        leading = ""
-        for char in chunk:
-            if not char.isdigit():
-                break
-            leading += char
-        if not leading:
-            break
-        parts.append(int(leading))
-    return tuple(parts)
-
 
 def clear_cache() -> None:
     _cache.clear()
@@ -230,6 +190,28 @@ def _get_structured_candidates_uncached(filters: HybridFilters, limit: int) -> H
         conn.close()
 
 
+def _resolve_relaxation(conn, filters: HybridFilters) -> AppliedRelaxation | None:
+    """The first relaxation rung that matches anything, or None if none does.
+
+    The hybrid path needs to know *which* constraints ended up applying, but
+    not which restaurants satisfy them - those go into the vector query as
+    predicates rather than as a list of ids (see _semantic_search). Each probe
+    is `limit 1` against indexed columns, and the common case answers on the
+    first rung.
+    """
+    ladder = relaxation_ladder(filters.max_price, filters.min_rating)
+
+    # Whether *anything* matches is decided entirely by place/cuisine, which
+    # are never relaxed - so if the fully-relaxed rung is empty, every rung is.
+    if len(ladder) > 1 and not _structured_query(conn, filters, ladder[-1], limit=1):
+        return None
+
+    for attempt in ladder:
+        if _structured_query(conn, filters, attempt, limit=1):
+            return attempt
+    return None
+
+
 def get_structured_candidates(filters: HybridFilters, limit: int = DEFAULT_LIMIT) -> HybridRetrievalResult:
     """Structured-only ranking (rating desc, votes desc), walking the relaxation ladder until
     something matches. Used when there's no vibe_query to run semantic search with. Cached (see
@@ -244,7 +226,7 @@ def get_structured_candidates(filters: HybridFilters, limit: int = DEFAULT_LIMIT
     return result
 
 
-def _vector_search_settings(conn, review_limit: int, filtered: bool) -> str:
+def _vector_search_settings(review_limit: int, filtered: bool) -> str:
     """SQL prelude raising HNSW's search effort for this transaction only.
 
     Returned as a string to be prepended to the search statement rather than
@@ -257,64 +239,102 @@ def _vector_search_settings(conn, review_limit: int, filtered: bool) -> str:
     unrelated queries. Transaction scope means it is undone by the rollback
     the pool performs on release.
 
-    On a filtered search pgvector post-filters - it walks the graph, then
-    discards everything outside the restaurant pool - so the default ef_search
-    of 40 can leave almost nothing behind. Where pgvector >= 0.8 is available,
-    iterative scan lets it keep walking until it has enough rows that actually
-    pass the filter, which is the real fix rather than just a bigger constant.
+    Filtered and unfiltered searches get opposite treatment - see the branch
+    below for the measurements behind that.
     """
-    global _supports_iterative_scan
-
     ef_search = max(MIN_HNSW_EF_SEARCH, review_limit)
-    if _supports_iterative_scan is None:
-        with conn.cursor() as cur:
-            cur.execute("select extversion from pg_extension where extname = 'vector';")
-            row = cur.fetchone()
-        version = _parse_extension_version(row[0]) if row else ()
-        _supports_iterative_scan = version >= MIN_ITERATIVE_SCAN_VERSION
-        logger.info(
-            "pgvector %s detected; iterative scan for filtered search %s",
-            row[0] if row else "(not installed)",
-            "enabled" if _supports_iterative_scan else f"unavailable, relying on ef_search={ef_search}",
-        )
 
-    settings = [f"set local hnsw.ef_search = {ef_search}"]
-    if filtered and _supports_iterative_scan:
-        # relaxed_order (not strict_order): we re-rank by fused score
-        # afterwards anyway, so paying for pgvector to return rows in exact
-        # distance order would be wasted work.
-        settings.append("set local hnsw.iterative_scan = 'relaxed_order'")
-    return "; ".join(settings) + "; "
+    if filtered:
+        # Scan the filtered subset exactly rather than approximately.
+        #
+        # Filtered HNSW is post-filtered: it walks the graph and discards
+        # everything outside the predicate, so it grinds hardest at *moderate*
+        # selectivity - exactly where real queries live. Measured over six
+        # distinct query vectors, "quiet in Whitefield" (584 restaurants, ~6.5%
+        # of reviews) took 1.797s via the index against 0.179s scanning the
+        # subset directly; a neighbouring case of almost the same size (BTM,
+        # 516) took 0.164s either way, because the planner's selectivity
+        # estimate happened to land differently. That cliff is the problem: not
+        # that the index is slow on average, but that whether you fall off it
+        # is unpredictable.
+        #
+        # Scanning is bounded and predictable instead - worst case measured was
+        # 0.813s with a filter matching nearly the whole corpus, still better
+        # than the index's worst case. Approximation only earns its keep when
+        # the candidate set is genuinely unbounded, which is the unfiltered
+        # branch below.
+        return "set local enable_indexscan = off; set local enable_indexonlyscan = off; "
+
+    return f"set local hnsw.ef_search = {ef_search}; "
 
 
 def _semantic_search(
-    conn, vibe_query: str, restaurant_ids: list[int] | None, review_limit: int
+    conn,
+    vibe_query: str,
+    review_limit: int,
+    filters: HybridFilters | None = None,
+    relaxation: AppliedRelaxation | None = None,
+    restaurant_ids: list[int] | None = None,
 ) -> list[tuple[int, int, float | None, float]]:
     """Returns (review_id, restaurant_id, review_rating, similarity) rows, best matches first.
 
+    Restriction comes in one of two forms. `filters`/`relaxation` join to
+    `restaurants` and apply the structured predicates directly - that is the
+    search path, and it lets every eligible restaurant compete regardless of
+    how many there are. `restaurant_ids` restricts to an explicit list, which
+    is what the single-restaurant follow-up path needs.
+
+    Expressing the search path as a join is what removed the old pool cap. The
+    previous shape fetched the top N matching restaurants by rating, then
+    passed their ids back in - so rating decided who was allowed to compete
+    before the vibe query was read at all, and three areas in the dataset
+    (Whitefield 584, BTM 516, HSR 509) exceeded the cap and silently lost their
+    lowest-rated members. Rating is already one of the two fusion signals; it
+    should not also be a gate.
+
     Deliberately does NOT select review_text. Scoring needs a similarity per
     review; only the handful of snippets actually displayed need their text.
-    Selecting it here meant hauling ~300 full review bodies (~240KB) across
-    the network to show 15 of them - which, against a remote database, was the
-    single largest cost in a retrieval call. Text is fetched afterwards, for
-    the survivors only, by _fetch_candidates_with_texts.
+    Text is fetched afterwards, for the survivors only, by
+    _fetch_candidates_with_texts.
     """
     query_embedding = get_embedder().encode(vibe_query)
 
-    prelude = _vector_search_settings(conn, review_limit, filtered=restaurant_ids is not None)
-
-    sql = prelude + (
-        "select id, restaurant_id, review_rating, "
-        "1 - (embedding <=> %s) as similarity "
-        "from restaurant_reviews where embedding is not null"
-    )
+    predicates: list[str] = []
     params: list = [query_embedding]
 
+    if filters is not None:
+        if filters.place:
+            predicates.append("r.place = %s")
+            params.append(filters.place)
+        if filters.cuisines:
+            predicates.append("r.cuisines && %s")
+            params.append(filters.cuisines)
+        if relaxation is not None:
+            if relaxation.used_max_price is not None:
+                predicates.append("r.price <= %s")
+                params.append(relaxation.used_max_price)
+            if relaxation.used_min_rating is not None:
+                predicates.append("r.rating >= %s")
+                params.append(relaxation.used_min_rating)
     if restaurant_ids is not None:
-        sql += " and restaurant_id = any(%s)"
+        predicates.append("v.restaurant_id = any(%s)")
         params.append(restaurant_ids)
 
-    sql += " order by embedding <=> %s limit %s"
+    prelude = _vector_search_settings(review_limit, filtered=bool(predicates))
+
+    sql = prelude + (
+        "select v.id, v.restaurant_id, v.review_rating, "
+        "1 - (v.embedding <=> %s) as similarity from restaurant_reviews v "
+    )
+    # Only join when a structured predicate needs it - an unfiltered vibe query
+    # has no reason to touch the restaurants table at all.
+    if filters is not None and (filters.place or filters.cuisines or relaxation is not None):
+        sql += "join restaurants r on r.id = v.restaurant_id "
+    sql += "where v.embedding is not null"
+    for predicate in predicates:
+        sql += f" and {predicate}"
+
+    sql += " order by v.embedding <=> %s limit %s"
     params.extend([query_embedding, review_limit])
 
     with conn.cursor() as cur:
@@ -496,26 +516,37 @@ def _get_hybrid_candidates_uncached(filters: HybridFilters, vibe_query: str, lim
     # is exactly the kind of thing that only shows up under concurrency (see
     # MAX_POOL_SIZE in app.storage.db, which the request threadpool is now
     # sized against).
-    restaurant_pool: list[int] | None = None
-    relaxation: AppliedRelaxation | None = None
-    if _has_any_filter(filters):
-        structured = get_structured_candidates(filters, limit=STRUCTURED_POOL_SIZE)
-        restaurant_pool = [c.id for c in structured.candidates]
-        relaxation = structured.relaxation
-        if not restaurant_pool:
-            # Structured filters matched nothing at all (even fully relaxed) -
-            # nothing to rank semantically.
-            logger.info("Hybrid retrieval: structured filters matched nothing, skipping semantic search")
-            return HybridRetrievalResult(candidates=[], relaxation=relaxation, used_semantic=True)
-
     review_limit = max(limit * SEMANTIC_REVIEW_MULTIPLIER, MIN_SEMANTIC_REVIEW_POOL)
 
     conn = get_connection()
     candidates: list[RestaurantCandidate] | None = None
     similarities: dict[int, list[float]] = {}
+    relaxation: AppliedRelaxation | None = None
     try:
         ensure_vector_registered(conn)
-        review_rows = _semantic_search(conn, vibe_query, restaurant_pool, review_limit=review_limit)
+
+        if _has_any_filter(filters):
+            # Which constraints apply, not which restaurants satisfy them -
+            # the predicates go straight into the search below, so every
+            # eligible restaurant competes however many there are.
+            relaxation = _resolve_relaxation(conn, filters)
+            if relaxation is None:
+                logger.info("Hybrid retrieval: structured filters matched nothing, skipping semantic search")
+                return HybridRetrievalResult(
+                    candidates=[],
+                    relaxation=relaxation_ladder(filters.max_price, filters.min_rating)[-1],
+                    used_semantic=True,
+                )
+            if relaxation.is_relaxed:
+                logger.info("Hybrid retrieval: relaxed constraints (%s)", relaxation.describe())
+
+        review_rows = _semantic_search(
+            conn,
+            vibe_query,
+            review_limit=review_limit,
+            filters=filters if _has_any_filter(filters) else None,
+            relaxation=relaxation,
+        )
         snippets, similarities = _group_reviews_by_restaurant(review_rows)
 
         if similarities:
@@ -569,7 +600,9 @@ def _get_reviews_for_restaurant_uncached(restaurant_id: int, vibe_query: str | N
 
         if vibe_query:
             ensure_vector_registered(conn)
-            review_rows = _semantic_search(conn, vibe_query, [restaurant_id], review_limit=limit)
+            review_rows = _semantic_search(
+                conn, vibe_query, review_limit=limit, restaurant_ids=[restaurant_id]
+            )
             _, texts = _fetch_candidates_with_texts(conn, [restaurant_id], [row[0] for row in review_rows])
             candidate.review_snippets = [
                 ReviewSnippet(

@@ -93,26 +93,3 @@ def test_ordering_is_deterministic_across_calls():
     first = [f.restaurant_id for f in reciprocal_rank_fusion(rankings)]
     second = [f.restaurant_id for f in reciprocal_rank_fusion(rankings)]
     assert first == second
-
-
-# --- pgvector capability detection ---------------------------------------------
-#
-# Lives here rather than in a DB test because it's pure parsing. The detection
-# it feeds got this wrong once already: probing pg_settings for
-# hnsw.iterative_scan reports "absent" on a version that has it, because an
-# extension's GUCs only register after its library loads on the first vector
-# operation.
-
-
-def test_extension_version_parsing():
-    from app.retrieval.hybrid import MIN_ITERATIVE_SCAN_VERSION, _parse_extension_version
-
-    assert _parse_extension_version("0.8.2") == (0, 8, 2)
-    assert _parse_extension_version("0.7.4") == (0, 7, 4)
-    assert _parse_extension_version("0.8.0-rc1") == (0, 8, 0)
-    assert _parse_extension_version("") == ()
-
-    assert _parse_extension_version("0.8.2") >= MIN_ITERATIVE_SCAN_VERSION
-    assert _parse_extension_version("1.0.0") >= MIN_ITERATIVE_SCAN_VERSION
-    assert not _parse_extension_version("0.7.4") >= MIN_ITERATIVE_SCAN_VERSION
-    assert not _parse_extension_version("") >= MIN_ITERATIVE_SCAN_VERSION
