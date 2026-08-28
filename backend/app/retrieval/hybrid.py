@@ -29,13 +29,11 @@ Three entry points:
 import logging
 from dataclasses import dataclass, field
 
-from pgvector.psycopg2 import register_vector
-
 from app.retrieval.cache import CACHE_MISS, TTLCache
 from app.retrieval.fusion import SEMANTIC_TOP_K, reciprocal_rank_fusion, semantic_score
 from app.retrieval.relaxation import AppliedRelaxation, relaxation_ladder
 from app.reviews.embedding_model import get_embedder
-from app.storage.db import get_connection
+from app.storage.db import ensure_vector_registered, get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +63,7 @@ SEMANTIC_REVIEW_MULTIPLIER = 40
 # an unfiltered search but far too small for a *filtered* one: pgvector
 # post-filters, so with a restaurant_id restriction covering a few percent of
 # the corpus most of those 40 get discarded and the query silently returns far
-# fewer rows than asked for. See _apply_vector_search_tuning.
+# fewer rows than asked for. See _vector_search_settings.
 MIN_HNSW_EF_SEARCH = 400
 
 # The restaurant/review data is a one-time Hugging Face dataset load (app.data/app.reviews)
@@ -246,13 +244,18 @@ def get_structured_candidates(filters: HybridFilters, limit: int = DEFAULT_LIMIT
     return result
 
 
-def _apply_vector_search_tuning(conn, review_limit: int, filtered: bool) -> None:
-    """Raises HNSW's search effort for this transaction only.
+def _vector_search_settings(conn, review_limit: int, filtered: bool) -> str:
+    """SQL prelude raising HNSW's search effort for this transaction only.
 
-    `set local` (not `set`) matters here: connections are pooled and handed to
-    the next caller afterwards, so a session-level GUC would silently leak
-    into unrelated queries. Transaction scope means it's undone on the
-    rollback the pool performs on release.
+    Returned as a string to be prepended to the search statement rather than
+    executed on its own. Against a remote database every statement is a round
+    trip costing ~200ms, and a bare `SET` bought nothing else - sending it
+    attached to the query it configures makes it free.
+
+    `set local` (not `set`) still matters: connections are pooled and handed
+    to the next caller afterwards, so a session-level GUC would leak into
+    unrelated queries. Transaction scope means it is undone by the rollback
+    the pool performs on release.
 
     On a filtered search pgvector post-filters - it walks the graph, then
     discards everything outside the restaurant pool - so the default ef_search
@@ -263,37 +266,45 @@ def _apply_vector_search_tuning(conn, review_limit: int, filtered: bool) -> None
     global _supports_iterative_scan
 
     ef_search = max(MIN_HNSW_EF_SEARCH, review_limit)
-    with conn.cursor() as cur:
-        cur.execute("set local hnsw.ef_search = %s;", (ef_search,))
-
-        if _supports_iterative_scan is None:
+    if _supports_iterative_scan is None:
+        with conn.cursor() as cur:
             cur.execute("select extversion from pg_extension where extname = 'vector';")
             row = cur.fetchone()
-            version = _parse_extension_version(row[0]) if row else ()
-            _supports_iterative_scan = version >= MIN_ITERATIVE_SCAN_VERSION
-            logger.info(
-                "pgvector %s detected; iterative scan for filtered search %s",
-                row[0] if row else "(not installed)",
-                "enabled" if _supports_iterative_scan else f"unavailable, relying on ef_search={ef_search}",
-            )
+        version = _parse_extension_version(row[0]) if row else ()
+        _supports_iterative_scan = version >= MIN_ITERATIVE_SCAN_VERSION
+        logger.info(
+            "pgvector %s detected; iterative scan for filtered search %s",
+            row[0] if row else "(not installed)",
+            "enabled" if _supports_iterative_scan else f"unavailable, relying on ef_search={ef_search}",
+        )
 
-        if filtered and _supports_iterative_scan:
-            # relaxed_order (not strict_order): we re-rank by fused score
-            # afterwards anyway, so paying for pgvector to return rows in exact
-            # distance order would be wasted work.
-            cur.execute("set local hnsw.iterative_scan = 'relaxed_order';")
+    settings = [f"set local hnsw.ef_search = {ef_search}"]
+    if filtered and _supports_iterative_scan:
+        # relaxed_order (not strict_order): we re-rank by fused score
+        # afterwards anyway, so paying for pgvector to return rows in exact
+        # distance order would be wasted work.
+        settings.append("set local hnsw.iterative_scan = 'relaxed_order'")
+    return "; ".join(settings) + "; "
 
 
 def _semantic_search(
     conn, vibe_query: str, restaurant_ids: list[int] | None, review_limit: int
-) -> list[tuple[int, int, str, float | None, float]]:
-    """Returns (review_id, restaurant_id, review_text, review_rating, similarity) rows, best matches first."""
+) -> list[tuple[int, int, float | None, float]]:
+    """Returns (review_id, restaurant_id, review_rating, similarity) rows, best matches first.
+
+    Deliberately does NOT select review_text. Scoring needs a similarity per
+    review; only the handful of snippets actually displayed need their text.
+    Selecting it here meant hauling ~300 full review bodies (~240KB) across
+    the network to show 15 of them - which, against a remote database, was the
+    single largest cost in a retrieval call. Text is fetched afterwards, for
+    the survivors only, by _fetch_candidates_with_texts.
+    """
     query_embedding = get_embedder().encode(vibe_query)
 
-    _apply_vector_search_tuning(conn, review_limit, filtered=restaurant_ids is not None)
+    prelude = _vector_search_settings(conn, review_limit, filtered=restaurant_ids is not None)
 
-    sql = (
-        "select id, restaurant_id, review_text, review_rating, "
+    sql = prelude + (
+        "select id, restaurant_id, review_rating, "
         "1 - (embedding <=> %s) as similarity "
         "from restaurant_reviews where embedding is not null"
     )
@@ -311,6 +322,61 @@ def _semantic_search(
         return cur.fetchall()
 
 
+def _fetch_candidates_with_texts(
+    conn, restaurant_ids: list[int], review_ids: list[int]
+) -> tuple[dict[int, RestaurantCandidate], dict[int, str]]:
+    """Full restaurant rows and the bodies of the snippets they'll show, in one
+    statement.
+
+    These were two queries, which on a remote database is two round trips at
+    ~200ms each - more than the transfer they were saving. The left join keeps
+    restaurants that have no surviving snippet (a structured-only match), and
+    the restaurant columns repeat per review row, which is cheap at five
+    restaurants and three snippets each.
+    """
+    if not restaurant_ids:
+        return {}, {}
+    columns = ", ".join(f"r.{c}" for c in RESTAURANT_COLUMNS)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"select {columns}, v.id, v.review_text from restaurants r "
+            "left join restaurant_reviews v on v.restaurant_id = r.id and v.id = any(%s) "
+            "where r.id = any(%s);",
+            (review_ids, restaurant_ids),
+        )
+        rows = cur.fetchall()
+
+    n = len(RESTAURANT_COLUMNS)
+    facts: dict[int, RestaurantCandidate] = {}
+    texts: dict[int, str] = {}
+    for row in rows:
+        restaurant_id = row[0]
+        if restaurant_id not in facts:
+            facts[restaurant_id] = _row_to_candidate(row[:n])
+        review_id, review_text = row[n], row[n + 1]
+        if review_id is not None:
+            texts[review_id] = review_text
+    return facts, texts
+
+
+def _fetch_ranking_facts(conn, restaurant_ids: list[int]) -> dict[int, tuple[float, int]]:
+    """(rating, votes) only, for building the structured ranking.
+
+    The full restaurant row is needed for the handful of candidates that end
+    up being returned, not for the couple of hundred that merely take part in
+    ranking. Fetching every column for all of them was transferring names,
+    cuisine arrays and addresses that were about to be discarded.
+    """
+    if not restaurant_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id, rating, votes from restaurants where id = any(%s);",
+            (restaurant_ids,),
+        )
+        return {row[0]: (float(row[1]), row[2]) for row in cur.fetchall()}
+
+
 def _fetch_restaurants(conn, restaurant_ids: list[int]) -> dict[int, RestaurantCandidate]:
     if not restaurant_ids:
         return {}
@@ -323,26 +389,26 @@ def _fetch_restaurants(conn, restaurant_ids: list[int]) -> dict[int, RestaurantC
 
 
 def _group_reviews_by_restaurant(
-    review_rows: list[tuple[int, int, str, float | None, float]],
-) -> tuple[dict[int, list[ReviewSnippet]], dict[int, list[float]]]:
-    """Splits raw pgvector rows into per-restaurant snippets (capped, for
-    display) and per-restaurant similarity lists (uncapped, for scoring)."""
-    snippets: dict[int, list[ReviewSnippet]] = {}
+    review_rows: list[tuple[int, int, float | None, float]],
+) -> tuple[dict[int, list[tuple[int, float | None, float]]], dict[int, list[float]]]:
+    """Splits raw pgvector rows into per-restaurant snippet candidates
+    (capped, for display) and per-restaurant similarity lists (uncapped, for
+    scoring).
+
+    Snippet candidates carry (review_id, rating, similarity) rather than a
+    finished ReviewSnippet, because the text isn't loaded yet - see
+    _semantic_search. Rows arrive best-match-first, so taking the first
+    SNIPPETS_PER_RESTAURANT per restaurant keeps its strongest evidence.
+    """
+    snippets: dict[int, list[tuple[int, float | None, float]]] = {}
     similarities: dict[int, list[float]] = {}
 
-    for review_id, restaurant_id, text, rating, similarity in review_rows:
+    for review_id, restaurant_id, rating, similarity in review_rows:
         similarity = float(similarity)
         similarities.setdefault(restaurant_id, []).append(similarity)
         bucket = snippets.setdefault(restaurant_id, [])
         if len(bucket) < SNIPPETS_PER_RESTAURANT:
-            bucket.append(
-                ReviewSnippet(
-                    id=review_id,
-                    text=text,
-                    rating=float(rating) if rating is not None else None,
-                    similarity=similarity,
-                )
-            )
+            bucket.append((review_id, float(rating) if rating is not None else None, similarity))
     return snippets, similarities
 
 
@@ -374,6 +440,54 @@ def get_hybrid_candidates(filters: HybridFilters, vibe_query: str | None, limit:
     return result
 
 
+def _fuse_and_hydrate(
+    conn,
+    snippets: dict[int, list[tuple[int, float | None, float]]],
+    similarities: dict[int, list[float]],
+    ranking_facts: dict[int, tuple[float, int]],
+    limit: int,
+) -> list[RestaurantCandidate]:
+    """Merges the two rankings, then loads full data for the survivors only.
+
+    Two independent orderings of the same restaurants. Semantic: the strength
+    *and* the amount of supporting review evidence. Structured: the
+    restaurant's own quality, which pure semantic ranking would otherwise
+    throw away entirely.
+
+    Hydration happens after fusion rather than before it, so the expensive
+    columns - the full restaurant row, and the review bodies - are fetched for
+    `limit` restaurants instead of the couple of hundred that merely took part
+    in ranking.
+    """
+    semantic_ranking = sorted(
+        similarities.keys(),
+        key=lambda rid: (-semantic_score(similarities[rid]), rid),
+    )
+    structured_ranking = sorted(
+        (rid for rid in similarities if rid in ranking_facts),
+        key=lambda rid: (-ranking_facts[rid][0], -ranking_facts[rid][1], rid),
+    )
+
+    fused = reciprocal_rank_fusion([structured_ranking, semantic_ranking])
+    top_ids = [f.restaurant_id for f in fused if f.restaurant_id in ranking_facts][:limit]
+
+    snippet_ids = [review_id for rid in top_ids for review_id, _, _ in snippets.get(rid, [])]
+    facts, texts = _fetch_candidates_with_texts(conn, top_ids, snippet_ids)
+
+    candidates: list[RestaurantCandidate] = []
+    for rid in top_ids:
+        candidate = facts.get(rid)
+        if candidate is None:
+            continue
+        candidate.review_snippets = [
+            ReviewSnippet(id=review_id, text=texts[review_id], rating=rating, similarity=similarity)
+            for review_id, rating, similarity in snippets.get(rid, [])
+            if review_id in texts
+        ]
+        candidates.append(candidate)
+    return candidates
+
+
 def _get_hybrid_candidates_uncached(filters: HybridFilters, vibe_query: str, limit: int) -> HybridRetrievalResult:
     # Structured work happens *before* this function takes a connection of its
     # own, and the semantic-empty fallback happens after it has released one.
@@ -397,52 +511,28 @@ def _get_hybrid_candidates_uncached(filters: HybridFilters, vibe_query: str, lim
     review_limit = max(limit * SEMANTIC_REVIEW_MULTIPLIER, MIN_SEMANTIC_REVIEW_POOL)
 
     conn = get_connection()
+    candidates: list[RestaurantCandidate] | None = None
+    similarities: dict[int, list[float]] = {}
     try:
-        register_vector(conn)
+        ensure_vector_registered(conn)
         review_rows = _semantic_search(conn, vibe_query, restaurant_pool, review_limit=review_limit)
+        snippets, similarities = _group_reviews_by_restaurant(review_rows)
 
-        if not review_rows:
-            facts: dict[int, RestaurantCandidate] = {}
-            similarities: dict[int, list[float]] = {}
-            snippets: dict[int, list[ReviewSnippet]] = {}
-        else:
-            snippets, similarities = _group_reviews_by_restaurant(review_rows)
-            facts = _fetch_restaurants(conn, list(similarities.keys()))
+        if similarities:
+            # Rank on (rating, votes) alone - the full restaurant rows are
+            # only worth fetching for the few that survive fusion.
+            ranking_facts = _fetch_ranking_facts(conn, list(similarities.keys()))
+            candidates = _fuse_and_hydrate(conn, snippets, similarities, ranking_facts, limit)
     finally:
         conn.close()
 
-    if not similarities:
+    if candidates is None:
         # No reviews matched semantically (e.g. sparse pool) - fall back to structured ranking.
         logger.info("Hybrid retrieval: semantic search matched no reviews, falling back to structured ranking")
         fallback = get_structured_candidates(filters, limit=limit)
         return HybridRetrievalResult(
             candidates=fallback.candidates, relaxation=fallback.relaxation, used_semantic=False
         )
-    # Two independent orderings of the same restaurants, merged by rank.
-    # Semantic: strength *and* amount of supporting review evidence.
-    # Structured: the restaurant's own quality, which pure semantic ranking
-    # would otherwise throw away entirely.
-    semantic_ranking = sorted(
-        similarities.keys(),
-        key=lambda rid: (-semantic_score(similarities[rid]), rid),
-    )
-    structured_ranking = sorted(
-        (rid for rid in similarities if rid in facts),
-        key=lambda rid: (-float(facts[rid].rating), -facts[rid].votes, rid),
-    )
-
-    fused = reciprocal_rank_fusion([structured_ranking, semantic_ranking])
-
-    candidates: list[RestaurantCandidate] = []
-    for entry in fused:
-        candidate = facts.get(entry.restaurant_id)
-        if candidate is None:
-            continue
-        candidate.review_snippets = snippets.get(entry.restaurant_id, [])
-        candidates.append(candidate)
-        if len(candidates) == limit:
-            break
-
     logger.info(
         "Hybrid retrieval: %d candidate(s) across %d matched restaurant(s), fused (top-%d semantic evidence)",
         len(candidates), len(similarities), SEMANTIC_TOP_K,
@@ -478,16 +568,18 @@ def _get_reviews_for_restaurant_uncached(restaurant_id: int, vibe_query: str | N
         candidate = _row_to_candidate(row)
 
         if vibe_query:
-            register_vector(conn)
+            ensure_vector_registered(conn)
             review_rows = _semantic_search(conn, vibe_query, [restaurant_id], review_limit=limit)
+            _, texts = _fetch_candidates_with_texts(conn, [restaurant_id], [row[0] for row in review_rows])
             candidate.review_snippets = [
                 ReviewSnippet(
                     id=review_id,
-                    text=text,
+                    text=texts[review_id],
                     rating=float(rating) if rating is not None else None,
                     similarity=float(similarity),
                 )
-                for review_id, _, text, rating, similarity in review_rows
+                for review_id, _, rating, similarity in review_rows
+                if review_id in texts
             ]
         else:
             with conn.cursor() as cur:

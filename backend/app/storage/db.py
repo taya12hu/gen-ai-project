@@ -30,6 +30,7 @@ import logging
 import os
 import threading
 
+from pgvector.psycopg2 import register_vector
 from psycopg2.extensions import connection as _Psycopg2Connection
 from psycopg2.pool import PoolError, ThreadedConnectionPool
 
@@ -118,3 +119,24 @@ def get_connection():
     except PoolError:
         logger.warning("Connection pool exhausted (max=%d) while acquiring a connection", MAX_POOL_SIZE)
         raise
+
+
+def ensure_vector_registered(conn) -> None:
+    """Registers pgvector's type adapters on `conn`, at most once per
+    underlying connection.
+
+    register_vector() looks the `vector` type's OID up in pg_type, which is a
+    full round trip - ~150ms against a remote database, and it was being paid
+    on every single retrieval call even though the adapters are
+    connection-scoped and survive both transactions and the rollback the pool
+    performs on release.
+
+    The flag lives on the connection object rather than in a module-level set:
+    when the pool discards a connection and dials a new one, that new object
+    starts without the flag and re-registers, which is exactly right. Keying a
+    cache on id() or DSN would have to guess at that lifecycle.
+    """
+    if getattr(conn, "_pc_vector_registered", False):
+        return
+    register_vector(conn)
+    conn._pc_vector_registered = True
