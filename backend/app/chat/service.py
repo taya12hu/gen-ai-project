@@ -25,11 +25,12 @@ handle_chat_message composes all three for the plain non-streaming path.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.chat.prompt_builder import build_chat_prompt
 from app.chat.response_formatter import ChatReply, format_chat_reply
-from app.conversation.preferences import get_preferences, upsert_preferences
+from app.conversation.filters import SearchState, get_state, merge, save_state
+from app.conversation.preferences import PREFERENCE_KEYS, get_preferences, upsert_preferences
 from app.conversation.store import (
     ConversationNotFoundError,
     add_message,
@@ -40,7 +41,12 @@ from app.conversation.store import (
 )
 from app.llm.groq_client import get_recommendation, stream_recommendation
 from app.query_understanding.understanding import understand_query
-from app.retrieval.hybrid import HybridFilters, get_hybrid_candidates, get_reviews_for_restaurant
+from app.retrieval.hybrid import (
+    HybridFilters,
+    evidence_is_weak,
+    get_hybrid_candidates,
+    get_reviews_for_restaurant,
+)
 from app.retrieval.known_values import get_known_cuisines, get_known_places
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,12 @@ SEARCH_LIMIT = 5
 # stored fact should bias what gets surfaced, but a one-off request in the
 # current message can still override it.
 #
+# This is the same closed vocabulary the storage layer enforces (see
+# app.conversation.preferences.PREFERENCE_KEYS) rather than a second list
+# maintained alongside it - when the two drifted apart, a fact stored under a
+# key this module didn't recognize was saved, shown to the user, and then
+# never applied to anything.
+#
 # Being *eligible* doesn't mean a given preference is applied to every turn,
 # though - query understanding (see relevant_preference_keys below) decides
 # per-message whether a specific stored fact is actually relevant to what
@@ -60,7 +72,7 @@ SEARCH_LIMIT = 5
 # every search used to silently skew unrelated requests (e.g. a stored
 # "healthier" preference narrowing an unrelated "late-night meal" search)
 # with no way for the user to know why.
-VIBE_PREFERENCE_KEYS = {"dietary", "ambience", "occasion", "vibe"}
+VIBE_PREFERENCE_KEYS = frozenset(PREFERENCE_KEYS)
 
 
 def _effective_vibe_query(vibe_query: str | None, preferences: dict[str, str]) -> str | None:
@@ -77,6 +89,8 @@ class PreparedChatTurn:
     candidates: list
     referenced_restaurant: object | None
     new_preferences: dict[str, str]
+    # The constraints in force after this turn, for the UI's chips.
+    search_state: SearchState = field(default_factory=SearchState)
 
 
 def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -> PreparedChatTurn:
@@ -93,55 +107,101 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
 
     logger.info("Preparing chat turn for user_id=%s conversation_id=%s", user_id, conversation_id)
     recent_messages = get_messages(conversation_id, limit=HISTORY_LIMIT)
-    preferences = get_preferences(user_id)
-    vibe_preferences = {k: v for k, v in preferences.items() if k in VIBE_PREFERENCE_KEYS}
+    stored_preferences = {k: v for k, v in get_preferences(user_id).items() if k in VIBE_PREFERENCE_KEYS}
 
     known_places = get_known_places()
     known_cuisines = get_known_cuisines()
-    understanding = understand_query(message, recent_messages, known_places, known_cuisines, vibe_preferences)
+    # The model is shown the constraints already in force, not left to
+    # reconstruct them from the transcript. Without them a comparative like
+    # "something cheaper" has no anchor to be cheaper *than*, and the model
+    # reached for clearing the budget instead of tightening it.
+    current_state = get_state(conversation_id)
+    active_filters = "; ".join(c["label"] for c in current_state.as_chips()) or "(none)"
+    understanding = understand_query(
+        message, recent_messages, known_places, known_cuisines, stored_preferences,
+        active_filters=active_filters,
+    )
 
-    if understanding.new_preferences:
-        upsert_preferences(user_id, understanding.new_preferences)
-        preferences = {**preferences, **understanding.new_preferences}
+    # upsert returns what was actually persisted after key normalization,
+    # which can differ from what the model proposed - that's what the user
+    # should be told was remembered, not the model's raw suggestion.
+    new_preferences = upsert_preferences(user_id, understanding.new_preferences)
 
-    # Only the subset query understanding judged relevant to *this* message,
-    # not everything ever stored - this is what actually gets applied to
-    # retrieval and shown to the user as "used for this search" (see
-    # build_chat_prompt). A preference that exists but wasn't judged
-    # relevant this turn is simply not in play for this turn; it can still
-    # surface on a later turn where it genuinely applies.
-    applied_preferences = {k: v for k, v in vibe_preferences.items() if k in understanding.relevant_preference_keys}
+    # Two sources, combined:
+    #
+    # - Stored facts, but only the subset query understanding judged relevant
+    #   to *this* message. A preference that exists but wasn't judged relevant
+    #   this turn is simply not in play; it can still surface on a later turn
+    #   where it genuinely applies.
+    # - Facts stated in this very message, applied unconditionally. They don't
+    #   go through the relevance gate: that gate exists to stop an unrelated
+    #   fact from an older conversation leaking in, and something the user
+    #   just said out loud in the message being answered is by definition not
+    #   that. (This previously merged into a variable nothing read again, so
+    #   "I'm vegetarian - where should I eat?" remembered the preference and
+    #   then ignored it for the very request that stated it.)
+    applied_preferences = {
+        **{k: v for k, v in stored_preferences.items() if k in understanding.relevant_preference_keys},
+        **new_preferences,
+    }
+
+    # Constraints carry over explicitly rather than by the model re-reading
+    # them out of the transcript each turn. Chitchat and bare preference
+    # statements leave them untouched: "I'm vegetarian" should not wipe the
+    # area you were searching in.
+    search_state = current_state
+    if understanding.intent in ("search", "followup_question"):
+        search_state = merge(search_state, understanding, understanding.cleared_filters)
+        save_state(conversation_id, search_state)
+        logger.info("Search state for conversation_id=%s: %s", conversation_id, search_state.to_json())
 
     candidates: list = []
     referenced_restaurant = None
-    relaxed = False
+    relaxation_note: str | None = None
+    weak_evidence = False
 
     if understanding.intent == "followup_question" and understanding.refers_to_previous_restaurant:
         prior_ids = get_last_mentioned_restaurant_ids(conversation_id)
         if prior_ids:
-            referenced_restaurant = get_reviews_for_restaurant(
-                prior_ids[0], _effective_vibe_query(understanding.vibe_query, applied_preferences)
-            )
+            followup_vibe = _effective_vibe_query(understanding.vibe_query, applied_preferences)
+            referenced_restaurant = get_reviews_for_restaurant(prior_ids[0], followup_vibe)
+            # Only meaningful when a vibe query actually drove the selection -
+            # without one the snippets are the restaurant's top-rated reviews,
+            # carrying a placeholder similarity rather than a real score.
+            if referenced_restaurant is not None and followup_vibe:
+                weak_evidence = evidence_is_weak([referenced_restaurant])
         else:
             understanding.intent = "search"  # nothing to refer back to - fall through to a fresh search
 
     if understanding.intent == "search" or (
         understanding.intent == "followup_question" and referenced_restaurant is None
     ):
+        # From the merged state, not from this message alone - that is what
+        # makes "what about somewhere cheaper?" keep the area you were
+        # searching in.
         filters = HybridFilters(
-            place=understanding.place,
-            cuisines=understanding.cuisines,
-            max_price=understanding.max_price,
-            min_rating=understanding.min_rating,
+            place=search_state.place,
+            cuisines=list(search_state.cuisines),
+            max_price=search_state.max_price,
+            min_rating=search_state.min_rating,
         )
         result = get_hybrid_candidates(
             filters, _effective_vibe_query(understanding.vibe_query, applied_preferences), limit=SEARCH_LIMIT
         )
         candidates = result.candidates
-        relaxed = result.relaxed
+        relaxation_note = result.relaxation_note()
+        weak_evidence = result.evidence_is_weak
 
     prompt = build_chat_prompt(
-        message, understanding, candidates, relaxed, recent_messages, applied_preferences, referenced_restaurant
+        message,
+        understanding,
+        candidates,
+        relaxation_note,
+        recent_messages,
+        applied_preferences,
+        referenced_restaurant,
+        weak_evidence=weak_evidence,
+        search_state=search_state,
     )
 
     return PreparedChatTurn(
@@ -150,7 +210,8 @@ def prepare_chat_turn(user_id: int, conversation_id: int | None, message: str) -
         prompt=prompt,
         candidates=candidates,
         referenced_restaurant=referenced_restaurant,
-        new_preferences=understanding.new_preferences,
+        new_preferences=new_preferences,
+        search_state=search_state,
     )
 
 

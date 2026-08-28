@@ -10,24 +10,31 @@ Structured facts stay structured; only the qualitative remainder goes
 through embeddings - and when both are present, the semantic search is
 restricted to the structured candidate pool, so "quiet date spot in
 Koramangala under Rs800" never returns a quiet place outside Koramangala
-just because its reviews scored well semantically.
+just because its reviews scored well.
+
+The two halves produce two orderings of the same restaurants, and both are
+kept: see app.retrieval.fusion for why they're merged by rank (RRF) rather
+than by discarding the structured signal the moment a vibe query appears.
+Soft numeric constraints are loosened a step at a time when nothing matches,
+rather than dropped wholesale - see app.retrieval.relaxation.
 
 Three entry points:
 - get_hybrid_candidates: the main "search" path (query understanding's
   intent=search).
 - get_reviews_for_restaurant: the "followup_question" path, for a message
   that refers back to one restaurant already named in the conversation.
-- (internally) semantic_search_reviews: the shared pgvector query.
+- (internally) _semantic_search: the shared pgvector query.
 """
 
 import logging
 from dataclasses import dataclass, field
 
-from pgvector.psycopg2 import register_vector
-
 from app.retrieval.cache import CACHE_MISS, TTLCache
+from app.retrieval import rerank
+from app.retrieval.fusion import SEMANTIC_TOP_K, reciprocal_rank_fusion, semantic_score
+from app.retrieval.relaxation import AppliedRelaxation, relaxation_ladder
 from app.reviews.embedding_model import get_embedder
-from app.storage.db import get_connection
+from app.storage.db import ensure_vector_registered, get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +42,42 @@ RESTAURANT_COLUMNS = ["id", "name", "place", "city", "cuisines", "price", "ratin
 
 DEFAULT_LIMIT = 10
 SNIPPETS_PER_RESTAURANT = 3
-SEMANTIC_POOL_MULTIPLIER = 8  # pull more reviews than needed so aggregation-by-restaurant has room
+
+# Reviews to pull from pgvector before aggregating by restaurant. Each
+# restaurant holds up to 15 reviews (see app.reviews.ingest), so a small
+# review pool can collapse to only a handful of distinct restaurants; this has
+# to be generous enough that aggregation has real choice.
+MIN_SEMANTIC_REVIEW_POOL = 300
+SEMANTIC_REVIEW_MULTIPLIER = 40
+
+# HNSW explores `ef_search` candidates per query. The default (40) is fine for
+# an unfiltered search but far too small for a *filtered* one: pgvector
+# post-filters, so with a restaurant_id restriction covering a few percent of
+# the corpus most of those 40 get discarded and the query silently returns far
+# fewer rows than asked for. See _vector_search_settings.
+MIN_HNSW_EF_SEARCH = 400
+
+# Below this cosine similarity, a review snippet is not evidence for the vibe
+# it was retrieved against - it is simply the closest thing a small pool had.
+#
+# This is an empirical constant, which is exactly the kind of thing that
+# usually drifts with the dataset, so what it controls matters: it does not
+# suppress or reorder anything. It only decides whether the prompt is *told*
+# the evidence is thin, so being wrong costs an unnecessary hedge sentence in
+# one direction or a missing one in the other - never a lost result.
+#
+# Measured over the evaluation scenarios (mean similarity of shown snippets):
+#     unfiltered "cosy and quiet"                          0.297
+#     Indiranagar + North Indian, "quiet ... conversation"  0.376
+#     Whitefield, "quiet place away from crowds"           0.412
+#     HSR relaxed, "great ambience for a date"             0.220  judged 0/3 relevant
+#     Kaggadasapura relaxed, "cosy and quiet"              0.115  judged 0/5 relevant
+#
+# Genuine matches bottom out around 0.26; the two sets the LLM judge scored
+# zero on top out around 0.24. 0.25 sits in that gap. Relaxed searches produce
+# most of the low end, because relaxing is what creates pools small enough
+# that every review qualifies as a "match" regardless of what it says.
+WEAK_EVIDENCE_SIMILARITY = 0.25
 
 # The restaurant/review data is a one-time Hugging Face dataset load (app.data/app.reviews)
 # with no live refresh pipeline, so a long TTL is safe - it isn't going to serve
@@ -45,7 +87,6 @@ SEMANTIC_POOL_MULTIPLIER = 8  # pull more reviews than needed so aggregation-by-
 # clear_cache() (or just restart the process) to avoid serving week-old results.
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # 1 week
 _cache = TTLCache(ttl_seconds=CACHE_TTL_SECONDS)
-
 
 def clear_cache() -> None:
     _cache.clear()
@@ -57,6 +98,9 @@ class ReviewSnippet:
     text: str
     rating: float | None
     similarity: float
+    # Cross-encoder relevance logit, when reranking ran for this query.
+    # None means it didn't - which is different from 'it scored badly'.
+    rerank_score: float | None = None
 
 
 @dataclass
@@ -84,15 +128,66 @@ class HybridFilters:
 @dataclass
 class HybridRetrievalResult:
     candidates: list[RestaurantCandidate]
-    relaxed: bool  # price/rating constraints were dropped to find any structured matches
+    relaxation: AppliedRelaxation | None
     used_semantic: bool
+
+    @property
+    def relaxed(self) -> bool:
+        """True when price/rating constraints had to be loosened to find
+        anything. Kept as a plain bool because most callers only need to know
+        *whether* to mention it; `relaxation.describe()` says what changed."""
+        return self.relaxation is not None and self.relaxation.is_relaxed
+
+    def relaxation_note(self) -> str | None:
+        return self.relaxation.describe() if self.relaxation is not None else None
+
+    @property
+    def evidence_is_weak(self) -> bool:
+        return evidence_is_weak(self.candidates)
+
+
+def evidence_is_weak(candidates) -> bool:
+    """Whether the review snippets attached to these candidates are too far
+    from the vibe query to support a qualitative claim.
+
+    A structurally-gated candidate set - "only restaurants whose reviews
+    surfaced in the semantic search" - stops meaning anything once the pool is
+    small. Kaggadasapura + Chinese is about five restaurants and thirty
+    reviews, so every one clears a top-300 cut trivially and "has evidence"
+    degrades to "exists". Its snippets come back at similarity 0.10-0.15,
+    about biryani masala and noodle packaging, for a query asking about
+    somewhere cosy and quiet.
+
+    Judged against the best snippet rather than the average: if even the
+    strongest one is weak, nothing shown supports the request.
+
+    Deliberately still cosine, not the cross-encoder's score, even though the
+    cross-encoder is the better relevance judge and reranking now attaches one.
+    Its logits are calibrated for MS MARCO passage ranking, and on review text
+    the scale shifts: a snippet reading "loved the cosy corner seating, soft
+    music, never crowded" - a genuinely good answer to a query about somewhere
+    quiet - scores -8.65. Treating zero as the relevant/irrelevant boundary
+    would flag that as no evidence at all. The cosine threshold is fitted to
+    this dataset, which is a real weakness, but it was at least validated
+    against the LLM judge's verdicts; the cross-encoder boundary would be an
+    unvalidated guess wearing the costume of a principled constant.
+
+    The cross-encoder is trusted for *ordering*, where only the relative order
+    of its scores matters, and not for this absolute judgement.
+    """
+    similarities = [s.similarity for c in candidates for s in c.review_snippets]
+    if not similarities:
+        return False  # nothing shown, so nothing to over-claim about
+    return max(similarities) < WEAK_EVIDENCE_SIMILARITY
 
 
 def _row_to_candidate(row) -> RestaurantCandidate:
     return RestaurantCandidate(**dict(zip(RESTAURANT_COLUMNS, row)))
 
 
-def _structured_query(conn, filters: HybridFilters, enforce_price_rating: bool, limit: int) -> list[RestaurantCandidate]:
+def _structured_query(
+    conn, filters: HybridFilters, relaxation: AppliedRelaxation, limit: int
+) -> list[RestaurantCandidate]:
     sql = "select " + ", ".join(RESTAURANT_COLUMNS) + " from restaurants where true"
     params: list = []
 
@@ -102,15 +197,14 @@ def _structured_query(conn, filters: HybridFilters, enforce_price_rating: bool, 
     if filters.cuisines:
         sql += " and cuisines && %s"
         params.append(filters.cuisines)
-    if enforce_price_rating:
-        if filters.max_price is not None:
-            sql += " and price <= %s"
-            params.append(filters.max_price)
-        if filters.min_rating is not None:
-            sql += " and rating >= %s"
-            params.append(filters.min_rating)
+    if relaxation.used_max_price is not None:
+        sql += " and price <= %s"
+        params.append(relaxation.used_max_price)
+    if relaxation.used_min_rating is not None:
+        sql += " and rating >= %s"
+        params.append(relaxation.used_min_rating)
 
-    sql += " order by rating desc, votes desc limit %s"
+    sql += " order by rating desc, votes desc, id limit %s"
     params.append(limit)
 
     with conn.cursor() as cur:
@@ -130,21 +224,62 @@ def _structured_cache_key(filters: HybridFilters, limit: int) -> tuple:
 def _get_structured_candidates_uncached(filters: HybridFilters, limit: int) -> HybridRetrievalResult:
     conn = get_connection()
     try:
-        strict = _structured_query(conn, filters, enforce_price_rating=True, limit=limit)
-        if strict:
-            logger.info("Structured retrieval: %d candidate(s), no relaxation needed", len(strict))
-            return HybridRetrievalResult(candidates=strict, relaxed=False, used_semantic=False)
+        ladder = relaxation_ladder(filters.max_price, filters.min_rating)
 
-        relaxed = _structured_query(conn, filters, enforce_price_rating=False, limit=limit)
-        logger.info("Structured retrieval: strict filters matched nothing, relaxed to %d candidate(s)", len(relaxed))
-        return HybridRetrievalResult(candidates=relaxed, relaxed=True, used_semantic=False)
+        # Probe the loosest rung first when there's a ladder to walk. Whether
+        # *anything* matches is decided entirely by place/cuisine, which are
+        # never relaxed - so if the fully-relaxed rung is empty, every rung is,
+        # and walking them all is a guaranteed-wasted series of round trips on
+        # exactly the query that already disappointed the user.
+        if len(ladder) > 1 and not _structured_query(conn, filters, ladder[-1], limit=1):
+            logger.info("Structured retrieval: place/cuisine filters match nothing; skipping relaxation ladder")
+            return HybridRetrievalResult(candidates=[], relaxation=ladder[-1], used_semantic=False)
+
+        for attempt in ladder:
+            candidates = _structured_query(conn, filters, attempt, limit)
+            if candidates:
+                if attempt.is_relaxed:
+                    logger.info(
+                        "Structured retrieval: %d candidate(s) after relaxing (%s)",
+                        len(candidates), attempt.describe(),
+                    )
+                else:
+                    logger.info("Structured retrieval: %d candidate(s), no relaxation needed", len(candidates))
+                return HybridRetrievalResult(candidates=candidates, relaxation=attempt, used_semantic=False)
+
+        # Every rung matched nothing: place/cuisine alone rule everything out,
+        # and those are never relaxed (see app.retrieval.relaxation).
+        logger.info("Structured retrieval: no candidates even with all numeric constraints dropped")
+        return HybridRetrievalResult(candidates=[], relaxation=ladder[-1], used_semantic=False)
     finally:
         conn.close()
 
 
+def _resolve_relaxation(conn, filters: HybridFilters) -> AppliedRelaxation | None:
+    """The first relaxation rung that matches anything, or None if none does.
+
+    The hybrid path needs to know *which* constraints ended up applying, but
+    not which restaurants satisfy them - those go into the vector query as
+    predicates rather than as a list of ids (see _semantic_search). Each probe
+    is `limit 1` against indexed columns, and the common case answers on the
+    first rung.
+    """
+    ladder = relaxation_ladder(filters.max_price, filters.min_rating)
+
+    # Whether *anything* matches is decided entirely by place/cuisine, which
+    # are never relaxed - so if the fully-relaxed rung is empty, every rung is.
+    if len(ladder) > 1 and not _structured_query(conn, filters, ladder[-1], limit=1):
+        return None
+
+    for attempt in ladder:
+        if _structured_query(conn, filters, attempt, limit=1):
+            return attempt
+    return None
+
+
 def get_structured_candidates(filters: HybridFilters, limit: int = DEFAULT_LIMIT) -> HybridRetrievalResult:
-    """Structured-only ranking (rating desc, votes desc), with relax-on-empty logic generalized to
-    all-optional filters. Used when there's no vibe_query to run semantic search with. Cached (see
+    """Structured-only ranking (rating desc, votes desc), walking the relaxation ladder until
+    something matches. Used when there's no vibe_query to run semantic search with. Cached (see
     cache.py): identical filters/limit within the TTL window skip the DB round trip entirely."""
     key = _structured_cache_key(filters, limit)
     cached = _cache.get(key)
@@ -156,22 +291,115 @@ def get_structured_candidates(filters: HybridFilters, limit: int = DEFAULT_LIMIT
     return result
 
 
-def _semantic_search(conn, vibe_query: str, restaurant_ids: list[int] | None, review_limit: int) -> list[tuple[int, int, str, float | None, float]]:
-    """Returns (review_id, restaurant_id, review_text, review_rating, similarity) rows, best matches first."""
+def _vector_search_settings(review_limit: int, filtered: bool) -> str:
+    """SQL prelude raising HNSW's search effort for this transaction only.
+
+    Returned as a string to be prepended to the search statement rather than
+    executed on its own. Against a remote database every statement is a round
+    trip costing ~200ms, and a bare `SET` bought nothing else - sending it
+    attached to the query it configures makes it free.
+
+    `set local` (not `set`) still matters: connections are pooled and handed
+    to the next caller afterwards, so a session-level GUC would leak into
+    unrelated queries. Transaction scope means it is undone by the rollback
+    the pool performs on release.
+
+    Filtered and unfiltered searches get opposite treatment - see the branch
+    below for the measurements behind that.
+    """
+    ef_search = max(MIN_HNSW_EF_SEARCH, review_limit)
+
+    if filtered:
+        # Scan the filtered subset exactly rather than approximately.
+        #
+        # Filtered HNSW is post-filtered: it walks the graph and discards
+        # everything outside the predicate, so it grinds hardest at *moderate*
+        # selectivity - exactly where real queries live. Measured over six
+        # distinct query vectors, "quiet in Whitefield" (584 restaurants, ~6.5%
+        # of reviews) took 1.797s via the index against 0.179s scanning the
+        # subset directly; a neighbouring case of almost the same size (BTM,
+        # 516) took 0.164s either way, because the planner's selectivity
+        # estimate happened to land differently. That cliff is the problem: not
+        # that the index is slow on average, but that whether you fall off it
+        # is unpredictable.
+        #
+        # Scanning is bounded and predictable instead - worst case measured was
+        # 0.813s with a filter matching nearly the whole corpus, still better
+        # than the index's worst case. Approximation only earns its keep when
+        # the candidate set is genuinely unbounded, which is the unfiltered
+        # branch below.
+        return "set local enable_indexscan = off; set local enable_indexonlyscan = off; "
+
+    return f"set local hnsw.ef_search = {ef_search}; "
+
+
+def _semantic_search(
+    conn,
+    vibe_query: str,
+    review_limit: int,
+    filters: HybridFilters | None = None,
+    relaxation: AppliedRelaxation | None = None,
+    restaurant_ids: list[int] | None = None,
+) -> list[tuple[int, int, float | None, float]]:
+    """Returns (review_id, restaurant_id, review_rating, similarity) rows, best matches first.
+
+    Restriction comes in one of two forms. `filters`/`relaxation` join to
+    `restaurants` and apply the structured predicates directly - that is the
+    search path, and it lets every eligible restaurant compete regardless of
+    how many there are. `restaurant_ids` restricts to an explicit list, which
+    is what the single-restaurant follow-up path needs.
+
+    Expressing the search path as a join is what removed the old pool cap. The
+    previous shape fetched the top N matching restaurants by rating, then
+    passed their ids back in - so rating decided who was allowed to compete
+    before the vibe query was read at all, and three areas in the dataset
+    (Whitefield 584, BTM 516, HSR 509) exceeded the cap and silently lost their
+    lowest-rated members. Rating is already one of the two fusion signals; it
+    should not also be a gate.
+
+    Deliberately does NOT select review_text. Scoring needs a similarity per
+    review; only the handful of snippets actually displayed need their text.
+    Text is fetched afterwards, for the survivors only, by
+    _fetch_candidates_with_texts.
+    """
     query_embedding = get_embedder().encode(vibe_query)
 
-    sql = (
-        "select id, restaurant_id, review_text, review_rating, "
-        "1 - (embedding <=> %s) as similarity "
-        "from restaurant_reviews where embedding is not null"
-    )
+    predicates: list[str] = []
     params: list = [query_embedding]
 
+    if filters is not None:
+        if filters.place:
+            predicates.append("r.place = %s")
+            params.append(filters.place)
+        if filters.cuisines:
+            predicates.append("r.cuisines && %s")
+            params.append(filters.cuisines)
+        if relaxation is not None:
+            if relaxation.used_max_price is not None:
+                predicates.append("r.price <= %s")
+                params.append(relaxation.used_max_price)
+            if relaxation.used_min_rating is not None:
+                predicates.append("r.rating >= %s")
+                params.append(relaxation.used_min_rating)
     if restaurant_ids is not None:
-        sql += " and restaurant_id = any(%s)"
+        predicates.append("v.restaurant_id = any(%s)")
         params.append(restaurant_ids)
 
-    sql += " order by embedding <=> %s limit %s"
+    prelude = _vector_search_settings(review_limit, filtered=bool(predicates))
+
+    sql = prelude + (
+        "select v.id, v.restaurant_id, v.review_rating, "
+        "1 - (v.embedding <=> %s) as similarity from restaurant_reviews v "
+    )
+    # Only join when a structured predicate needs it - an unfiltered vibe query
+    # has no reason to touch the restaurants table at all.
+    if filters is not None and (filters.place or filters.cuisines or relaxation is not None):
+        sql += "join restaurants r on r.id = v.restaurant_id "
+    sql += "where v.embedding is not null"
+    for predicate in predicates:
+        sql += f" and {predicate}"
+
+    sql += " order by v.embedding <=> %s limit %s"
     params.extend([query_embedding, review_limit])
 
     with conn.cursor() as cur:
@@ -179,25 +407,94 @@ def _semantic_search(conn, vibe_query: str, restaurant_ids: list[int] | None, re
         return cur.fetchall()
 
 
-def _attach_snippets(conn, ranked_restaurant_ids: list[int], snippets_by_restaurant: dict[int, list[ReviewSnippet]]) -> list[RestaurantCandidate]:
-    if not ranked_restaurant_ids:
-        return []
+def _fetch_candidates_with_texts(
+    conn, restaurant_ids: list[int], review_ids: list[int]
+) -> tuple[dict[int, RestaurantCandidate], dict[int, str]]:
+    """Full restaurant rows and the bodies of the snippets they'll show, in one
+    statement.
 
+    These were two queries, which on a remote database is two round trips at
+    ~200ms each - more than the transfer they were saving. The left join keeps
+    restaurants that have no surviving snippet (a structured-only match), and
+    the restaurant columns repeat per review row, which is cheap at five
+    restaurants and three snippets each.
+    """
+    if not restaurant_ids:
+        return {}, {}
+    columns = ", ".join(f"r.{c}" for c in RESTAURANT_COLUMNS)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"select {columns}, v.id, v.review_text from restaurants r "
+            "left join restaurant_reviews v on v.restaurant_id = r.id and v.id = any(%s) "
+            "where r.id = any(%s);",
+            (review_ids, restaurant_ids),
+        )
+        rows = cur.fetchall()
+
+    n = len(RESTAURANT_COLUMNS)
+    facts: dict[int, RestaurantCandidate] = {}
+    texts: dict[int, str] = {}
+    for row in rows:
+        restaurant_id = row[0]
+        if restaurant_id not in facts:
+            facts[restaurant_id] = _row_to_candidate(row[:n])
+        review_id, review_text = row[n], row[n + 1]
+        if review_id is not None:
+            texts[review_id] = review_text
+    return facts, texts
+
+
+def _fetch_ranking_facts(conn, restaurant_ids: list[int]) -> dict[int, tuple[float, int]]:
+    """(rating, votes) only, for building the structured ranking.
+
+    The full restaurant row is needed for the handful of candidates that end
+    up being returned, not for the couple of hundred that merely take part in
+    ranking. Fetching every column for all of them was transferring names,
+    cuisine arrays and addresses that were about to be discarded.
+    """
+    if not restaurant_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id, rating, votes from restaurants where id = any(%s);",
+            (restaurant_ids,),
+        )
+        return {row[0]: (float(row[1]), row[2]) for row in cur.fetchall()}
+
+
+def _fetch_restaurants(conn, restaurant_ids: list[int]) -> dict[int, RestaurantCandidate]:
+    if not restaurant_ids:
+        return {}
     with conn.cursor() as cur:
         cur.execute(
             "select " + ", ".join(RESTAURANT_COLUMNS) + " from restaurants where id = any(%s);",
-            (ranked_restaurant_ids,),
+            (restaurant_ids,),
         )
-        by_id = {row[0]: _row_to_candidate(row) for row in cur.fetchall()}
+        return {row[0]: _row_to_candidate(row) for row in cur.fetchall()}
 
-    candidates = []
-    for rid in ranked_restaurant_ids:
-        candidate = by_id.get(rid)
-        if candidate is None:
-            continue
-        candidate.review_snippets = snippets_by_restaurant.get(rid, [])
-        candidates.append(candidate)
-    return candidates
+
+def _group_reviews_by_restaurant(
+    review_rows: list[tuple[int, int, float | None, float]],
+) -> tuple[dict[int, list[tuple[int, float | None, float]]], dict[int, list[float]]]:
+    """Splits raw pgvector rows into per-restaurant snippet candidates
+    (capped, for display) and per-restaurant similarity lists (uncapped, for
+    scoring).
+
+    Snippet candidates carry (review_id, rating, similarity) rather than a
+    finished ReviewSnippet, because the text isn't loaded yet - see
+    _semantic_search. Rows arrive best-match-first, so taking the first
+    SNIPPETS_PER_RESTAURANT per restaurant keeps its strongest evidence.
+    """
+    snippets: dict[int, list[tuple[int, float | None, float]]] = {}
+    similarities: dict[int, list[float]] = {}
+
+    for review_id, restaurant_id, rating, similarity in review_rows:
+        similarity = float(similarity)
+        similarities.setdefault(restaurant_id, []).append(similarity)
+        bucket = snippets.setdefault(restaurant_id, [])
+        if len(bucket) < SNIPPETS_PER_RESTAURANT:
+            bucket.append((review_id, float(rating) if rating is not None else None, similarity))
+    return snippets, similarities
 
 
 def _hybrid_cache_key(filters: HybridFilters, vibe_query: str | None, limit: int) -> tuple:
@@ -213,7 +510,7 @@ def _hybrid_cache_key(filters: HybridFilters, vibe_query: str | None, limit: int
 
 
 def get_hybrid_candidates(filters: HybridFilters, vibe_query: str | None, limit: int = DEFAULT_LIMIT) -> HybridRetrievalResult:
-    """Cached (see retrieval_cache.py): identical (filters, vibe_query, limit) within the TTL window
+    """Cached (see cache.py): identical (filters, vibe_query, limit) within the TTL window
     skip both the DB round trip and, for a vibe query, the embed + pgvector search."""
     if not vibe_query:
         return get_structured_candidates(filters, limit=limit)
@@ -228,53 +525,169 @@ def get_hybrid_candidates(filters: HybridFilters, vibe_query: str | None, limit:
     return result
 
 
-def _get_hybrid_candidates_uncached(filters: HybridFilters, vibe_query: str, limit: int) -> HybridRetrievalResult:
-    conn = get_connection()
-    try:
-        register_vector(conn)
+def _fuse_and_hydrate(
+    conn,
+    vibe_query: str,
+    snippets: dict[int, list[tuple[int, float | None, float]]],
+    similarities: dict[int, list[float]],
+    ranking_facts: dict[int, tuple[float, int]],
+    limit: int,
+) -> list[RestaurantCandidate]:
+    """Merges the two rankings, then loads full data for the survivors only.
 
-        restaurant_pool: list[int] | None = None
-        relaxed = False
+    Two independent orderings of the same restaurants. Semantic: the strength
+    *and* the amount of supporting review evidence. Structured: the
+    restaurant's own quality, which pure semantic ranking would otherwise
+    throw away entirely.
+
+    Hydration happens after fusion rather than before it, so the expensive
+    columns - the full restaurant row, and the review bodies - are fetched for
+    `limit` restaurants instead of the couple of hundred that merely took part
+    in ranking.
+    """
+    semantic_ranking = sorted(
+        similarities.keys(),
+        key=lambda rid: (-semantic_score(similarities[rid]), rid),
+    )
+    structured_ranking = sorted(
+        (rid for rid in similarities if rid in ranking_facts),
+        key=lambda rid: (-ranking_facts[rid][0], -ranking_facts[rid][1], rid),
+    )
+
+    fused = reciprocal_rank_fusion([structured_ranking, semantic_ranking])
+    ranked_ids = [f.restaurant_id for f in fused if f.restaurant_id in ranking_facts]
+
+    # Hydrate a shortlist rather than just the final `limit`, so the
+    # cross-encoder has something to choose between. Without reranking this
+    # collapses back to exactly the old behaviour.
+    shortlist = ranked_ids[: rerank.RERANK_POOL] if rerank.is_enabled() else ranked_ids[:limit]
+    snippet_ids = [review_id for rid in shortlist for review_id, _, _ in snippets.get(rid, [])]
+    facts, texts = _fetch_candidates_with_texts(conn, shortlist, snippet_ids)
+
+    built: dict[int, RestaurantCandidate] = {}
+    for rid in shortlist:
+        candidate = facts.get(rid)
+        if candidate is None:
+            continue
+        candidate.review_snippets = [
+            ReviewSnippet(id=review_id, text=texts[review_id], rating=rating, similarity=similarity)
+            for review_id, rating, similarity in snippets.get(rid, [])
+            if review_id in texts
+        ]
+        built[rid] = candidate
+
+    ordered_ids = _rerank_ids(vibe_query, shortlist, built)
+    return [built[rid] for rid in ordered_ids[:limit] if rid in built]
+
+
+def _rerank_ids(
+    vibe_query: str, shortlist: list[int], built: dict[int, RestaurantCandidate]
+) -> list[int]:
+    """Reorders the shortlist by cross-encoder relevance, or returns it
+    unchanged when reranking didn't run.
+
+    Scores every snippet of every shortlisted restaurant in one batched call,
+    then ranks each restaurant by its *best* snippet. Best rather than summed,
+    deliberately, and unlike the bi-encoder aggregation upstream: summing there
+    rewards a restaurant with several corroborating reviews, which is a
+    reasonable proxy when the signal per review is weak. Here the signal is
+    strong enough that one review genuinely answering the question is what
+    justifies recommending the place - and one is all the reply needs to
+    quote.
+    """
+    pairs: list[tuple[int, ReviewSnippet]] = [
+        (rid, snippet)
+        for rid in shortlist
+        if rid in built
+        for snippet in built[rid].review_snippets[: rerank.SNIPPETS_PER_CANDIDATE]
+    ]
+    if not pairs:
+        return shortlist
+
+    scores = rerank.score_pairs(vibe_query, [snippet.text for _, snippet in pairs])
+    if scores is None:
+        return shortlist  # unavailable or disabled - fusion order stands
+
+    best: dict[int, float] = {}
+    for (rid, snippet), score in zip(pairs, scores):
+        snippet.rerank_score = score
+        best[rid] = max(best.get(rid, float("-inf")), score)
+
+    # Snippets are shown in the order the reply will quote them, so the
+    # strongest evidence should lead.
+    for candidate in built.values():
+        candidate.review_snippets.sort(key=lambda s: s.rerank_score or float("-inf"), reverse=True)
+
+    reordered = sorted(shortlist, key=lambda rid: (-best.get(rid, float("-inf")), shortlist.index(rid)))
+    moved = sum(1 for i, rid in enumerate(reordered[:5]) if rid != shortlist[i])
+    logger.info(
+        "Reranked %d restaurant(s) from %d snippet(s); %d of the top 5 changed",
+        len(shortlist), len(pairs), moved,
+    )
+    return reordered
+
+
+def _get_hybrid_candidates_uncached(filters: HybridFilters, vibe_query: str, limit: int) -> HybridRetrievalResult:
+    # Structured work happens *before* this function takes a connection of its
+    # own, and the semantic-empty fallback happens after it has released one.
+    # Holding two pooled connections at once for a single request would make
+    # the pool's effective capacity half its size, and half of a bounded pool
+    # is exactly the kind of thing that only shows up under concurrency (see
+    # MAX_POOL_SIZE in app.storage.db, which the request threadpool is now
+    # sized against).
+    review_limit = max(limit * SEMANTIC_REVIEW_MULTIPLIER, MIN_SEMANTIC_REVIEW_POOL)
+
+    conn = get_connection()
+    candidates: list[RestaurantCandidate] | None = None
+    similarities: dict[int, list[float]] = {}
+    relaxation: AppliedRelaxation | None = None
+    try:
+        ensure_vector_registered(conn)
+
         if _has_any_filter(filters):
-            structured = get_structured_candidates(filters, limit=max(limit * SEMANTIC_POOL_MULTIPLIER, 50))
-            restaurant_pool = [c.id for c in structured.candidates]
-            relaxed = structured.relaxed
-            if not restaurant_pool:
-                # Structured filters matched nothing at all (even relaxed) - nothing to rank semantically.
+            # Which constraints apply, not which restaurants satisfy them -
+            # the predicates go straight into the search below, so every
+            # eligible restaurant competes however many there are.
+            relaxation = _resolve_relaxation(conn, filters)
+            if relaxation is None:
                 logger.info("Hybrid retrieval: structured filters matched nothing, skipping semantic search")
-                return HybridRetrievalResult(candidates=[], relaxed=True, used_semantic=True)
+                return HybridRetrievalResult(
+                    candidates=[],
+                    relaxation=relaxation_ladder(filters.max_price, filters.min_rating)[-1],
+                    used_semantic=True,
+                )
+            if relaxation.is_relaxed:
+                logger.info("Hybrid retrieval: relaxed constraints (%s)", relaxation.describe())
 
         review_rows = _semantic_search(
-            conn, vibe_query, restaurant_pool, review_limit=limit * SEMANTIC_POOL_MULTIPLIER
+            conn,
+            vibe_query,
+            review_limit=review_limit,
+            filters=filters if _has_any_filter(filters) else None,
+            relaxation=relaxation,
         )
+        snippets, similarities = _group_reviews_by_restaurant(review_rows)
 
-        snippets_by_restaurant: dict[int, list[ReviewSnippet]] = {}
-        ranked_ids: list[int] = []
-        for review_id, restaurant_id, text, rating, similarity in review_rows:
-            if restaurant_id not in snippets_by_restaurant:
-                snippets_by_restaurant[restaurant_id] = []
-                ranked_ids.append(restaurant_id)
-            if len(snippets_by_restaurant[restaurant_id]) < SNIPPETS_PER_RESTAURANT:
-                snippets_by_restaurant[restaurant_id].append(
-                    ReviewSnippet(
-                        id=review_id,
-                        text=text,
-                        rating=float(rating) if rating is not None else None,
-                        similarity=float(similarity),
-                    )
-                )
-
-        if not ranked_ids:
-            # No reviews matched semantically (e.g. sparse pool) - fall back to structured ranking.
-            logger.info("Hybrid retrieval: semantic search matched no reviews, falling back to structured ranking")
-            fallback = get_structured_candidates(filters, limit=limit)
-            return HybridRetrievalResult(candidates=fallback.candidates, relaxed=True, used_semantic=False)
-
-        candidates = _attach_snippets(conn, ranked_ids[:limit], snippets_by_restaurant)
-        logger.info("Hybrid retrieval: %d candidate(s) ranked semantically", len(candidates))
-        return HybridRetrievalResult(candidates=candidates, relaxed=relaxed, used_semantic=True)
+        if similarities:
+            # Rank on (rating, votes) alone - the full restaurant rows are
+            # only worth fetching for the few that survive fusion.
+            ranking_facts = _fetch_ranking_facts(conn, list(similarities.keys()))
+            candidates = _fuse_and_hydrate(conn, vibe_query, snippets, similarities, ranking_facts, limit)
     finally:
         conn.close()
+
+    if candidates is None:
+        # No reviews matched semantically (e.g. sparse pool) - fall back to structured ranking.
+        logger.info("Hybrid retrieval: semantic search matched no reviews, falling back to structured ranking")
+        fallback = get_structured_candidates(filters, limit=limit)
+        return HybridRetrievalResult(
+            candidates=fallback.candidates, relaxation=fallback.relaxation, used_semantic=False
+        )
+    logger.info(
+        "Hybrid retrieval: %d candidate(s) across %d matched restaurant(s), fused (top-%d semantic evidence)",
+        len(candidates), len(similarities), SEMANTIC_TOP_K,
+    )
+    return HybridRetrievalResult(candidates=candidates, relaxation=relaxation, used_semantic=True)
 
 
 def get_reviews_for_restaurant(restaurant_id: int, vibe_query: str | None, limit: int = SNIPPETS_PER_RESTAURANT) -> RestaurantCandidate | None:
@@ -305,16 +718,20 @@ def _get_reviews_for_restaurant_uncached(restaurant_id: int, vibe_query: str | N
         candidate = _row_to_candidate(row)
 
         if vibe_query:
-            register_vector(conn)
-            review_rows = _semantic_search(conn, vibe_query, [restaurant_id], review_limit=limit)
+            ensure_vector_registered(conn)
+            review_rows = _semantic_search(
+                conn, vibe_query, review_limit=limit, restaurant_ids=[restaurant_id]
+            )
+            _, texts = _fetch_candidates_with_texts(conn, [restaurant_id], [row[0] for row in review_rows])
             candidate.review_snippets = [
                 ReviewSnippet(
                     id=review_id,
-                    text=text,
+                    text=texts[review_id],
                     rating=float(rating) if rating is not None else None,
                     similarity=float(similarity),
                 )
-                for review_id, _, text, rating, similarity in review_rows
+                for review_id, _, rating, similarity in review_rows
+                if review_id in texts
             ]
         else:
             with conn.cursor() as cur:
@@ -342,12 +759,7 @@ def get_restaurants_by_ids(restaurant_ids: list[int]) -> dict[int, RestaurantCan
         return {}
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select " + ", ".join(RESTAURANT_COLUMNS) + " from restaurants where id = any(%s);",
-                (restaurant_ids,),
-            )
-            return {row[0]: _row_to_candidate(row) for row in cur.fetchall()}
+        return _fetch_restaurants(conn, restaurant_ids)
     finally:
         conn.close()
 

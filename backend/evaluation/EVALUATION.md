@@ -17,7 +17,13 @@ pipeline as a whole, across three pieces:
    `tests/test_semantic_retrieval.py`) — checks retrieval quality in
    isolation, independent of generation, against a small manually-verified
    ground truth.
-3. **A scorecard** (`run_eval.py`) that runs both suites plus an LLM judge
+3. **Hybrid filters + vibe** (`hybrid_retrieval.py`,
+   `tests/test_hybrid_retrieval.py`) — 8 scenarios combining structured
+   constraints *with* a qualitative query, checking **containment** (nothing
+   returned violates the constraints the retriever says it applied),
+   **evidence** (every candidate carries review snippets), and judged
+   relevance.
+4. **A scorecard** (`run_eval.py`) that runs all three suites plus an LLM judge
    and prints/saves a single summary — see "Scorecard" below.
 
 ## Scenarios (structured retrieval + generation)
@@ -99,6 +105,17 @@ Reporting both together is the point: metric 1 says "did it find *my*
 approved answers", metric 2 says "are the results it actually returned any
 good", and a result can score well on one and poorly on the other.
 
+**Current numbers (rank fusion, 2026-08-26).** After retrieval moved to
+summed top-3 review evidence fused with the structured ranking (see
+`app/retrieval/fusion.py`), Recall@5 went from 0.000 to 0.044 and Precision@5
+from 0.000 to 0.133, with 2 of 6 queries now returning at least one approved
+ground-truth id - the retriever had previously never matched a single one.
+Judged Relevance@5 moved the other way, 0.767 to 0.700, reproducibly across
+two runs. Both directions are consistent with what RRF does: it promotes
+higher-rated restaurants that match slightly less strongly on review text.
+Read that as a deliberate trade rather than a regression - and note that 30
+judgements is a small sample either way.
+
 **Known finding (from before the ground truth was widened).** With the
 original, stricter 3-4-ID ground truth, Recall@5 was 0.0 across all 6
 queries - not "low", zero. Spot-checking the actual retrieved reviews showed
@@ -119,6 +136,104 @@ threshold (see that file's docstring) - it's a structural/regression test,
 not a quality gate, regardless of how the ground truth changes. Read the
 actual Recall@5/Precision@5/Judged Relevance@5 numbers from `run_eval.py`'s
 scorecard.
+
+## Hybrid (filters + vibe) evaluation
+
+The other two suites each exercise half the retriever: the structured
+scenarios run with `vibe_query=None` so semantic search never executes, and
+the semantic queries run with an empty `HybridFilters()` so no structured
+predicate ever applies. Neither covers *"somewhere quiet in Whitefield under
+Rs 1000"* — the most common shape a real user types, and the only path where
+the two halves interact: where the filter restricts what semantic search may
+rank, where the relaxation ladder can fire, and where rank fusion has both
+signals to merge.
+
+That gap had teeth. Two changes confined to this interaction — removing the
+500-restaurant pool cap, and switching filtered searches from HNSW to exact
+scanning — were invisible to the scorecard, which reported identical numbers
+before and after by construction.
+
+**Scenarios.** 8, drawn from real data, covering the selectivity range the
+retriever behaves differently across: a narrow place+cuisine pool (134
+restaurants), a broad place-only pool (Whitefield, 584 — which exceeded the
+old cap), each numeric constraint alone, both together, two relaxation shapes,
+and an impossible cuisine.
+
+**Metrics — deliberately not recall.** The lesson from the semantic suite is
+that a small hand-picked ground truth grades a retriever unfairly over 9,000
+restaurants. This suite checks properties the path is supposed to *guarantee*
+instead:
+
+- *Containment* — every returned restaurant satisfies the hard constraints.
+  Place and cuisine strictly (never relaxed); price and rating against the
+  values the retriever reports it actually applied, so a legitimately relaxed
+  search is judged on what it promised rather than what was first asked.
+  Fully deterministic, no judge involved.
+- *Evidence* — every returned restaurant carries review snippets, since a
+  candidate with no supporting text cannot honestly answer a qualitative
+  request.
+- *Judged Relevance@5* — the same Gemini judge the semantic suite uses,
+  scoring whether that evidence genuinely supports the vibe.
+
+**What it found immediately.** Judged Relevance@5 came back at 0.364 against
+the vibe-only path's 0.700 — and the split was stark: unrelaxed scenarios
+averaged 12/25, while both *relaxed* scenarios scored **0/8**. Reading the
+actual snippets confirmed the judge: for "cosy and quiet" in Kaggadasapura the
+retriever returned reviews about biryani masala and noodle packaging, at
+similarities of 0.10–0.15.
+
+The cause is that a structurally-gated candidate set — "only restaurants whose
+reviews surfaced in the semantic search" — stops meaning anything once the
+pool is small. Kaggadasapura + Chinese is about five restaurants and thirty
+reviews, so every one clears a top-300 cut trivially and "has evidence"
+degrades to "exists". Relaxation makes this worse, because relaxing is what
+produces tiny pools in the first place.
+
+The retriever now flags this itself (`app.retrieval.hybrid.evidence_is_weak`)
+and the prompt is told, so a reply says it couldn't find places matching the
+mood rather than narrating whatever it was handed. Note that this does *not*
+move Judged Relevance@5 — that metric scores retrieval, and the flag changes
+only what is claimed about it. `scenarios_flagged_weak_evidence` tracks the
+detection separately.
+
+Unlike `tests/test_semantic_retrieval.py`, these tests **do** assert. That
+isn't inconsistent: recall over a tiny ground truth is fuzzy and a low score
+can be a bad draw, whereas containment is binary and a violation is a bug.
+
+## Cross-encoder reranking (off by default)
+
+`app/retrieval/rerank.py` adds a final stage that rescores the shortlist with a
+cross-encoder, which reads query and review *together* rather than comparing
+them as independent embeddings. It ships disabled (`RERANK_ENABLED=1` turns it
+on); both scorecards below come from the same suites, with reranking as the
+only variable.
+
+| Metric | off | on |
+|---|---|---|
+| Hybrid Judged Relevance@5 | 0.364 | **0.606** |
+| Semantic Judged Relevance@5 | 0.700 | **0.867** |
+| Semantic Recall@5 / Precision@5 | 0.044 / 0.133 | 0.033 / 0.100 |
+| Hybrid containment | 1.000 | 1.000 |
+| Hybrid latency (retrieval only) | 1.373s | 3.455s |
+| Semantic latency (retrieval only) | 2.211s | 4.794s |
+
+**On reading these.** The structured suite never reranks — every one of its
+scenarios passes `vibe_query=None`, so semantic search doesn't run — yet its
+judge score still moved 5.00 → 4.78 between the two runs. That drift on
+identical inputs is the judge's noise floor, roughly 0.2, and both relevance
+gains sit clearly outside it.
+
+Recall and precision moved *down* slightly while judged relevance moved up. The
+reranked results overlap less with the hand-picked ground truth while the
+judge — which never sees that id list — rates them better. That is the exact
+tension both metrics exist to expose (see "Known finding" below): 11–15
+approved ids across 9,216 restaurants is a weak signal, and `hit@5` held at
+2/6 either way.
+
+**Why it is off.** Roughly +2.1s per vibe query and ~90MB resident for a second
+model, measured on a 12-core development machine. This project deploys to a
+free-tier instance already tight enough to need a CPU-only torch pin, and
+slower than that. On capable hardware the trade is clearly worth taking.
 
 ## LLM-as-judge
 
@@ -144,9 +259,10 @@ runs, not a precise or fully reproducible measurement. See the comments in
 
 ## Scorecard (`run_eval.py`)
 
-Runs both suites - the 10 structured scenarios (with the helpfulness judge
-attached) and the 6 semantic retrieval scenarios (with the retrieval-
-relevance judge attached) - and prints one scorecard: grounding rate,
+Runs all three suites - the 10 structured scenarios (with the helpfulness
+judge attached), the 6 semantic retrieval scenarios and the 8 hybrid
+filters+vibe scenarios (both with the retrieval-relevance judge attached) -
+and prints one scorecard: grounding rate,
 relevance rate, avg LLM-judge helpfulness, avg latency (structured:
 retrieval+generation; semantic: retrieval only, reported separately so the
 two are never confused), semantic Recall@5/Precision@5/Judged Relevance@5,

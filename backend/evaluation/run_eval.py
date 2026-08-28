@@ -49,6 +49,7 @@ from pathlib import Path
 
 from app.llm.groq_client import DEFAULT_MODEL as DEFAULT_GROQ_MODEL
 from app.reviews.embedding_model import get_embedder
+from evaluation.hybrid_retrieval import run_all as run_all_hybrid_scenarios
 from evaluation.judge import judge_helpfulness, judge_retrieval_relevance
 from evaluation.semantic_retrieval import run_all_semantic_scenarios
 from evaluation.tests.test_evaluation import SCENARIOS, run_scenario
@@ -138,6 +139,35 @@ def run_structured_suite() -> list[StructuredScenarioResult]:
     return [_check_structured_scenario(*scenario) for scenario in SCENARIOS]
 
 
+def run_hybrid_suite():
+    """The filters-plus-vibe path - the only one where the structured and
+    semantic halves interact, and the one neither other suite touches."""
+    get_embedder()  # warm the model so per-scenario latency reflects steady state
+    results = run_all_hybrid_scenarios()
+    for r in results:
+        if r.candidates:
+            r.judged_relevant = judge_retrieval_relevance(r.scenario.vibe_query, r.candidates)
+    return results
+
+
+def _hybrid_result_to_dict(r) -> dict:
+    """Manual serialization, same reasoning as _semantic_result_to_dict: the
+    full RestaurantCandidate objects are judge evidence, not scorecard data."""
+    return {
+        "scenario": r.scenario.label(),
+        "note": r.scenario.note,
+        "retrieved_ids": [c.id for c in r.candidates],
+        "relaxed": r.relaxed,
+        "relaxation_note": r.relaxation_note,
+        "evidence_weak": r.evidence_weak,
+        "contained": r.contained,
+        "violations": r.violations,
+        "evidence_rate": r.evidence_rate,
+        "judged_relevant": r.judged_relevant,
+        "latency_seconds": r.latency_seconds,
+    }
+
+
 def run_semantic_suite():
     get_embedder()  # warm the model once so per-query latency reflects steady state, not cold model load
     results = run_all_semantic_scenarios()
@@ -172,7 +202,7 @@ def _semantic_result_to_dict(r) -> dict:
     }
 
 
-def build_scorecard(structured_results, semantic_results, groq_model: str) -> dict:
+def build_scorecard(structured_results, semantic_results, hybrid_results, groq_model: str) -> dict:
     structured_total = len(structured_results)
     structured_passed = sum(r.passed for r in structured_results)
     grounding_rate = _avg([1.0 if r.grounded else 0.0 for r in structured_results if r.grounded is not None])
@@ -186,6 +216,15 @@ def build_scorecard(structured_results, semantic_results, groq_model: str) -> di
     avg_precision = _avg([r.precision_at_k for r in semantic_results])
     avg_judged_relevance = _judged_relevance_rate(semantic_results)
     avg_semantic_latency = _avg([r.latency_seconds for r in semantic_results])
+
+    hybrid_total = len(hybrid_results)
+    hybrid_passed = sum(r.passed for r in hybrid_results)
+    hybrid_contained = sum(r.contained for r in hybrid_results)
+    returned = [c for r in hybrid_results for c in r.candidates]
+    hybrid_evidence_rate = _avg([1.0 if c.review_snippets else 0.0 for c in returned])
+    hybrid_judged = _judged_relevance_rate(hybrid_results)
+    hybrid_weak = sum(1 for x in hybrid_results if x.evidence_weak)
+    avg_hybrid_latency = _avg([r.latency_seconds for r in hybrid_results])
 
     return {
         "groq_model": groq_model,
@@ -208,6 +247,19 @@ def build_scorecard(structured_results, semantic_results, groq_model: str) -> di
             "avg_judged_relevance_at_5": avg_judged_relevance,
             "avg_latency_seconds_retrieval_only": avg_semantic_latency,
             "details": [_semantic_result_to_dict(r) for r in semantic_results],
+        },
+        "hybrid_scenarios": {
+            "total": hybrid_total,
+            "passed": hybrid_passed,
+            "failed": hybrid_total - hybrid_passed,
+            "containment_rate": _avg([1.0 if r.contained else 0.0 for r in hybrid_results]),
+            "scenarios_fully_contained": hybrid_contained,
+            "restaurants_returned": len(returned),
+            "evidence_rate": hybrid_evidence_rate,
+            "avg_judged_relevance_at_5": hybrid_judged,
+            "scenarios_flagged_weak_evidence": hybrid_weak,
+            "avg_latency_seconds_retrieval_only": avg_hybrid_latency,
+            "details": [_hybrid_result_to_dict(r) for r in hybrid_results],
         },
     }
 
@@ -239,6 +291,16 @@ def print_scorecard(scorecard: dict) -> None:
     print(f"  Avg Judged Relevance@5 (LLM judge) : {_fmt(v['avg_judged_relevance_at_5'])}")
     print(f"  Avg latency (retrieval only)       : {_fmt(v['avg_latency_seconds_retrieval_only'])}s")
     print()
+    h = scorecard["hybrid_scenarios"]
+    print(f"Hybrid filters + vibe ({h['total']} scenarios, retrieval only):")
+    print(f"  Passed / total                     : {h['passed']}/{h['total']}")
+    print(f"  Containment rate                   : {_fmt(h['containment_rate'])}")
+    evidence_label = f"  Evidence rate ({h['restaurants_returned']} returned)"
+    print(f"{evidence_label:<37}: {_fmt(h['evidence_rate'])}")
+    print(f"  Avg Judged Relevance@5 (LLM judge) : {_fmt(h['avg_judged_relevance_at_5'])}")
+    print(f"  Flagged as weak evidence           : {h['scenarios_flagged_weak_evidence']}/{h['total']}")
+    print(f"  Avg latency (retrieval only)       : {_fmt(h['avg_latency_seconds_retrieval_only'])}s")
+    print()
     print("=" * 64)
 
 
@@ -261,7 +323,10 @@ def main() -> None:
     print("Running semantic retrieval scenarios (retrieval only, no LLM call)...")
     semantic_results = run_semantic_suite()
 
-    scorecard = build_scorecard(structured_results, semantic_results, groq_model)
+    print("Running hybrid filters+vibe scenarios (retrieval only, no LLM call)...")
+    hybrid_results = run_hybrid_suite()
+
+    scorecard = build_scorecard(structured_results, semantic_results, hybrid_results, groq_model)
     print_scorecard(scorecard)
 
     path = save_scorecard(scorecard)

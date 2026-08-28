@@ -8,9 +8,12 @@ chat endpoints (conversations, messages, streaming), behind a JWT dependency.
 import json
 import logging
 import os
+import uuid
+from contextlib import asynccontextmanager
 
+import anyio.to_thread
 import psycopg2
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -34,6 +37,7 @@ from app.chat.service import (
     prepare_chat_turn,
     stream_chat_message_tokens,
 )
+from app.conversation.filters import FILTER_DIMENSIONS, clear_dimension, get_state
 from app.conversation.preferences import delete_preference, list_preferences
 from app.conversation.store import (
     ConversationNotFoundError,
@@ -42,11 +46,50 @@ from app.conversation.store import (
     get_messages,
     list_conversations,
 )
+from app.logging_config import set_request_id
 from app.retrieval.hybrid import get_restaurants_by_ids, get_review_snippets_by_ids
+from app.storage.db import MAX_POOL_SIZE, get_connection
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Restaurant Recommendation Service")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Every route here is a sync def, so FastAPI runs it on AnyIO's worker
+    # thread pool - which defaults to 40 threads regardless of how many
+    # database connections exist. That mismatch meant concurrency past the
+    # pool size didn't queue, it raised PoolError and failed requests.
+    #
+    # Capping the threadpool at the pool size makes the connection pool the
+    # single place concurrency is bounded: excess requests wait for a worker
+    # instead of racing to fail on a connection that isn't there. It's safe to
+    # match exactly rather than halve because no request path holds two
+    # pooled connections at once (see app.retrieval.hybrid).
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = MAX_POOL_SIZE
+    logger.info("Request threadpool capped at %d workers to match the DB pool", MAX_POOL_SIZE)
+    yield
+
+
+app = FastAPI(title="AI Restaurant Recommendation Service", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    """Tags every log line produced while serving this request.
+
+    Without it, the pipeline's log lines - query understood, retrieval counts,
+    which LLM provider served the reply, turn persisted - interleave across
+    concurrent requests in one stream with no way to tell which turn each
+    belongs to. An inbound X-Request-ID is honoured so a proxy's id carries
+    through rather than being replaced.
+    """
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    set_request_id(request_id)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # Local dev origins are always allowed; FRONTEND_URL (already used for
 # password-reset links) adds the deployed frontend's origin in production.
@@ -142,6 +185,15 @@ class MessageOut(BaseModel):
     created_at: object
 
 
+class FilterChipOut(BaseModel):
+    """One active constraint, ready to render. The label is written by the
+    backend (see SearchState.as_chips) so the chip and the assistant's reply
+    describe the same constraint the same way."""
+
+    dimension: str
+    label: str
+
+
 class ChatMessageRequest(BaseModel):
     message: str = Field(min_length=1)
 
@@ -151,6 +203,7 @@ class ChatMessageResponse(BaseModel):
     reply: str
     matched_restaurants: list[MatchedRestaurantOut]
     new_preferences: dict[str, str] = {}
+    active_filters: list[FilterChipOut] = []
 
 
 class PreferenceOut(BaseModel):
@@ -184,8 +237,32 @@ def get_current_user(
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(response: Response):
+    """Liveness *and* dependency readiness.
+
+    This used to return {"status": "ok"} unconditionally, which made it
+    actively misleading: it's wired up as the platform's healthCheckPath
+    (see render.yaml), so an instance whose database was unreachable kept
+    reporting healthy and kept being sent traffic it could only fail. A
+    health check that can't fail isn't one.
+
+    The query is deliberately trivial - this reports whether a connection can
+    be acquired and used at all, not how the database is performing.
+    """
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select 1;")
+                cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("Health check failed: database unreachable (%s)", exc)
+        response.status_code = 503
+        return {"status": "degraded", "database": "unavailable"}
+
+    return {"status": "ok", "database": "ok"}
 
 
 # --- Auth routes ---------------------------------------------------------------
@@ -279,6 +356,41 @@ def forget_user_preference(key: str, current_user: dict = Depends(get_current_us
 # --- Chat routes (protected) ----------------------------------------------------
 
 
+def _filter_not_found_detail(dimension: str) -> dict:
+    return {
+        "error_code": "unknown_filter",
+        "message": f"Unknown filter {dimension!r}; expected one of {', '.join(FILTER_DIMENSIONS)}",
+    }
+
+
+@app.get("/chat/conversations/{conversation_id}/filters", response_model=list[FilterChipOut])
+def get_chat_filters(conversation_id: int, current_user: dict = Depends(get_current_user)):
+    try:
+        get_conversation(conversation_id, current_user["id"])
+    except ConversationNotFoundError:
+        raise HTTPException(status_code=404, detail=_conversation_not_found_detail())
+    return [FilterChipOut(**c) for c in get_state(conversation_id).as_chips()]
+
+
+@app.delete("/chat/conversations/{conversation_id}/filters/{dimension}", response_model=list[FilterChipOut])
+def clear_chat_filter(
+    conversation_id: int, dimension: str, current_user: dict = Depends(get_current_user)
+):
+    """Drops one constraint and returns what remains.
+
+    Returns the surviving chips rather than 204, so the UI updates from an
+    authoritative list instead of guessing what removal left behind.
+    """
+    try:
+        get_conversation(conversation_id, current_user["id"])
+    except ConversationNotFoundError:
+        raise HTTPException(status_code=404, detail=_conversation_not_found_detail())
+    if dimension not in FILTER_DIMENSIONS:
+        raise HTTPException(status_code=404, detail=_filter_not_found_detail(dimension))
+
+    return [FilterChipOut(**c) for c in clear_dimension(conversation_id, dimension).as_chips()]
+
+
 @app.post("/chat/conversations", response_model=ConversationOut, status_code=201)
 def create_chat_conversation(current_user: dict = Depends(get_current_user)):
     conversation = create_conversation(current_user["id"])
@@ -290,26 +402,47 @@ def list_chat_conversations(current_user: dict = Depends(get_current_user)):
     return [ConversationOut(**c) for c in list_conversations(current_user["id"])]
 
 
-def _hydrate_message(m: dict) -> MessageOut:
-    # A persisted message only carries ids (mentioned_restaurant_ids,
-    # mentioned_review_ids) - the full restaurant/review data shown live
-    # isn't stored, so a reloaded conversation has to look it up again. This
-    # replays the *exact* rows the live reply used (via the persisted ids),
-    # not a fresh top-rated/semantic re-selection - a structured-only query
-    # that showed no reviews live must show none on reload either.
-    restaurant_ids = m["mentioned_restaurant_ids"] or []
-    review_ids = m["mentioned_review_ids"] or []
-    restaurants_by_id = get_restaurants_by_ids(restaurant_ids)
-    snippets_by_restaurant = get_review_snippets_by_ids(review_ids)
+def _hydrate_messages(messages: list[dict]) -> list[MessageOut]:
+    """Attaches the restaurant/review data behind each message's persisted ids.
 
-    matched = []
-    for restaurant_id in restaurant_ids:
-        restaurant = restaurants_by_id.get(restaurant_id)
-        if restaurant is None:
-            continue
-        restaurant.review_snippets = snippets_by_restaurant.get(restaurant_id, [])
-        matched.append(_matched_restaurant_out(restaurant))
-    return MessageOut(**m, matched_restaurants=matched)
+    A persisted message only carries ids (mentioned_restaurant_ids,
+    mentioned_review_ids) - the full restaurant/review data shown live isn't
+    stored, so a reloaded conversation has to look it up again. This replays
+    the *exact* rows the live reply used (via the persisted ids), not a fresh
+    top-rated/semantic re-selection: a structured-only query that showed no
+    reviews live must show none on reload either.
+
+    Lookups are batched across the whole conversation rather than run
+    per-message. Hydrating one message at a time meant two queries (and two
+    pool checkouts) per message, so opening a 40-message conversation issued
+    80 round trips against a pool that holds 10 connections - the classic N+1,
+    and enough to starve concurrent requests on its own.
+    """
+    all_restaurant_ids = {rid for m in messages for rid in (m["mentioned_restaurant_ids"] or [])}
+    all_review_ids = {rid for m in messages for rid in (m["mentioned_review_ids"] or [])}
+
+    restaurants_by_id = get_restaurants_by_ids(sorted(all_restaurant_ids))
+    snippets_by_restaurant = get_review_snippets_by_ids(sorted(all_review_ids))
+
+    hydrated: list[MessageOut] = []
+    for m in messages:
+        restaurant_ids = m["mentioned_restaurant_ids"] or []
+        # Restrict each message to the review ids *it* recorded: two messages
+        # can cite the same restaurant with different supporting snippets, and
+        # the shared lookup above is keyed only by restaurant.
+        message_review_ids = set(m["mentioned_review_ids"] or [])
+
+        matched = []
+        for restaurant_id in restaurant_ids:
+            restaurant = restaurants_by_id.get(restaurant_id)
+            if restaurant is None:
+                continue
+            snippets = [
+                s for s in snippets_by_restaurant.get(restaurant_id, []) if s.id in message_review_ids
+            ]
+            matched.append(_matched_restaurant_out(restaurant, snippets))
+        hydrated.append(MessageOut(**m, matched_restaurants=matched))
+    return hydrated
 
 
 @app.get("/chat/conversations/{conversation_id}/messages", response_model=list[MessageOut])
@@ -318,10 +451,18 @@ def get_chat_messages(conversation_id: int, current_user: dict = Depends(get_cur
         get_conversation(conversation_id, current_user["id"])
     except ConversationNotFoundError:
         raise HTTPException(status_code=404, detail=_conversation_not_found_detail())
-    return [_hydrate_message(m) for m in get_messages(conversation_id)]
+    return _hydrate_messages(get_messages(conversation_id))
 
 
-def _matched_restaurant_out(r) -> MatchedRestaurantOut:
+def _matched_restaurant_out(r, snippets=None) -> MatchedRestaurantOut:
+    """`snippets` overrides the candidate's own attached snippets.
+
+    The batched reload path (_hydrate_messages) shares one restaurant object
+    across every message that cited it, so it passes each message's snippets
+    in explicitly rather than assigning them onto the shared object - which
+    would leak one message's evidence into another's card.
+    """
+    snippets = r.review_snippets if snippets is None else snippets
     return MatchedRestaurantOut(
         id=r.id,
         name=r.name,
@@ -332,7 +473,7 @@ def _matched_restaurant_out(r) -> MatchedRestaurantOut:
         rating=r.rating,
         rest_type=r.rest_type,
         votes=r.votes,
-        review_snippets=[ReviewSnippetOut(id=s.id, text=s.text, rating=s.rating) for s in r.review_snippets],
+        review_snippets=[ReviewSnippetOut(id=s.id, text=s.text, rating=s.rating) for s in snippets],
     )
 
 
@@ -380,6 +521,7 @@ def send_chat_message(
         reply=reply.reply_text,
         matched_restaurants=[_matched_restaurant_out(r) for r in reply.matched_restaurants],
         new_preferences=reply.new_preferences,
+        active_filters=[FilterChipOut(**c) for c in get_state(resolved_conversation_id).as_chips()],
     )
 
 
@@ -417,15 +559,36 @@ def send_chat_message_stream(
             yield _sse("error", detail)
             return
 
-        reply = finalize_chat_turn(prepared, "".join(chunks))
-        yield _sse(
-            "done",
-            {
+        # Finalizing has to be inside the generator's error handling too, not
+        # just token streaming. It was previously outside, so a database blip
+        # while persisting a *fully generated* reply let the exception escape
+        # uncaught: the connection simply ended with neither a "done" nor an
+        # "error" event, the client read that as a dropped stream, and its
+        # retry logic regenerated the whole turn from scratch - a second LLM
+        # call, and the answer the user had already watched arrive thrown
+        # away.
+        #
+        # Persistence failing is also not a reason to withhold the reply. The
+        # text is already on the user's screen; "done" carries the restaurant
+        # cards that make it useful. The turn is lost from history either way,
+        # and that's the smaller loss.
+        reply_text = "".join(chunks)
+        try:
+            reply = finalize_chat_turn(prepared, reply_text)
+            payload = {
                 "matched_restaurants": [
                     _matched_restaurant_out(r).model_dump() for r in reply.matched_restaurants
                 ],
                 "new_preferences": reply.new_preferences,
-            },
-        )
+                "active_filters": prepared.search_state.as_chips(),
+            }
+        except Exception:
+            logger.exception(
+                "Failed to finalize/persist a fully-streamed chat turn for conversation_id=%s",
+                prepared.conversation_id,
+            )
+            payload = {"matched_restaurants": [], "new_preferences": {}, "persisted": False}
+
+        yield _sse("done", payload)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -9,11 +9,14 @@ full wired-together pipeline through the actual HTTP interface.
 import os
 import uuid
 
+import psycopg2
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api import main
 from app.api.main import app
 from app.auth import password_reset
+from app.conversation import filters
 from app.storage.db import get_connection
 
 client = TestClient(app)
@@ -41,10 +44,25 @@ def auth_headers():
 # --- Health --------------------------------------------------------------------
 
 
-def test_health_check():
+def test_health_check_reports_database_reachability():
+    """The platform uses this as its healthCheckPath, so it has to be able to
+    fail. It previously returned {"status": "ok"} unconditionally, which meant
+    an instance with an unreachable database kept being sent traffic it could
+    only fail."""
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "database": "ok"}
+
+
+def test_health_check_reports_503_when_the_database_is_unreachable(monkeypatch):
+    def boom():
+        raise psycopg2.OperationalError("connection refused")
+
+    monkeypatch.setattr(main, "get_connection", boom)
+
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded"
 
 
 # --- Auth: register / login / me ----------------------------------------------
@@ -308,3 +326,95 @@ def test_recommend_endpoint_no_longer_exists():
 def test_options_endpoint_no_longer_exists():
     response = client.get("/options")
     assert response.status_code == 404
+
+
+# --- Conversation filters -----------------------------------------------------
+#
+# The structured constraints in force for a conversation, exposed so the UI can
+# show them as chips and remove them individually. Before they were held
+# explicitly, they lived only in the transcript - invisible to the user and
+# re-inferred by a model on every turn.
+
+
+def test_new_conversation_starts_with_no_filters(auth_headers):
+    conversation_id = client.post("/chat/conversations", headers=auth_headers).json()["id"]
+    response = client.get(f"/chat/conversations/{conversation_id}/filters", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_filters_require_authentication():
+    conversation_id = 1
+    assert client.get(f"/chat/conversations/{conversation_id}/filters").status_code == 401
+    assert client.delete(f"/chat/conversations/{conversation_id}/filters/place").status_code == 401
+
+
+def test_filters_of_another_users_conversation_are_not_readable(auth_headers):
+    """Same ownership rule as messages - a conversation id is not a capability."""
+    other = client.post(
+        "/auth/register",
+        json={"email": f"test-{uuid.uuid4().hex[:12]}@example.com", "password": "password123"},
+    ).json()
+    other_headers = {"Authorization": f"Bearer {other['access_token']}"}
+    conversation_id = client.post("/chat/conversations", headers=other_headers).json()["id"]
+
+    response = client.get(f"/chat/conversations/{conversation_id}/filters", headers=auth_headers)
+    assert response.status_code == 404
+
+
+def test_clearing_an_unknown_dimension_is_rejected(auth_headers):
+    """The dimension name is a shared vocabulary between model, API and UI;
+    an unrecognized one must fail loudly rather than silently clearing
+    nothing and leaving the user believing a constraint was removed."""
+    conversation_id = client.post("/chat/conversations", headers=auth_headers).json()["id"]
+    response = client.delete(
+        f"/chat/conversations/{conversation_id}/filters/budget", headers=auth_headers
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["error_code"] == "unknown_filter"
+
+
+def test_clearing_a_filter_returns_what_remains(auth_headers):
+    """Returns the surviving chips rather than 204, so the UI updates from an
+    authoritative list instead of guessing what removal left behind."""
+    conversation_id = client.post("/chat/conversations", headers=auth_headers).json()["id"]
+    filters.save_state(
+        conversation_id,
+        filters.SearchState(place="Indiranagar", cuisines=("Chinese",), max_price=800.0),
+    )
+
+    response = client.delete(
+        f"/chat/conversations/{conversation_id}/filters/place", headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    dimensions = {chip["dimension"] for chip in response.json()}
+    assert dimensions == {"cuisines", "price"}
+
+
+def test_clearing_a_filter_that_was_not_set_is_harmless(auth_headers):
+    """Removing a chip the UI has already dropped shouldn't 404 - the end
+    state the user wanted is the one they have."""
+    conversation_id = client.post("/chat/conversations", headers=auth_headers).json()["id"]
+    filters.save_state(conversation_id, filters.SearchState(place="Indiranagar"))
+
+    response = client.delete(
+        f"/chat/conversations/{conversation_id}/filters/rating", headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    assert [chip["dimension"] for chip in response.json()] == ["place"]
+
+
+def test_chip_labels_are_written_for_display(auth_headers):
+    """The backend owns the wording so a chip and the assistant's reply
+    describe the same constraint the same way."""
+    conversation_id = client.post("/chat/conversations", headers=auth_headers).json()["id"]
+    filters.save_state(conversation_id, filters.SearchState(max_price=800.0, min_rating=4.0))
+
+    labels = {c["dimension"]: c["label"] for c in
+              client.get(f"/chat/conversations/{conversation_id}/filters", headers=auth_headers).json()}
+    assert labels["price"] == "under Rs 800"
+    assert labels["rating"] == "4.0+ stars"

@@ -23,6 +23,13 @@ services:
         sync: false
       - key: PGPASSWORD
         sync: false
+      # Bounds both the connection pool and the request threadpool (see
+      # app/storage/db.py and the lifespan hook in app/api/main.py), so the
+      # server never admits more concurrent DB work than it has connections
+      # for. Keep it well under the Postgres instance's own connection limit
+      # once more than one app instance runs.
+      - key: DB_MAX_CONNECTIONS
+        value: "16"
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_MODEL
@@ -37,6 +44,11 @@ services:
         value: HS256
       - key: JWT_EXPIRE_MINUTES
         value: "60"
+      # Cross-encoder reranking. Deliberately off here: it costs ~2s per vibe
+      # query and ~90MB of resident memory for a second model, which the free
+      # tier - already needing a CPU-only torch pin to fit - cannot spare.
+      - key: RERANK_ENABLED
+        value: "0"
       - key: RESEND_API_KEY
         sync: false
       - key: RESEND_FROM_EMAIL

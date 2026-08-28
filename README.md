@@ -65,7 +65,10 @@ python -m app.conversation.schema
 python -m app.reviews.schema
 ```
 
-Fetch and load the restaurant dataset:
+Fetch and load the restaurant dataset. Every step is re-runnable: the load
+upserts on `(name, place)` rather than truncating, so restaurant ids stay
+stable and existing conversations keep pointing at the right rows.
+
 
 ```bash
 python -m app.data.acquisition
