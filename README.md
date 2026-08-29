@@ -1,6 +1,6 @@
 # DineMind
 
-An AI chat assistant that helps you find restaurants. Ask for what you want
+An AI chat assistant that helps you find restaurants in Bangalore. Ask for what you want
 in plain language ("suggest a quiet vegetarian place under ₹1000") and it
 grounds its answer in real restaurant data and real customer reviews,
 remembering your stated preferences across conversations.
